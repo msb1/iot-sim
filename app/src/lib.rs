@@ -1,3 +1,4 @@
+pub mod anomalies;
 pub mod config;
 #[path = "impl.rs"]
 pub mod domain;
@@ -9,6 +10,7 @@ pub mod telemetry;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anomalies::AnomalyInjector;
 use config::AppConfig;
 #[cfg(feature = "kafka")]
 use export::kafka::KafkaExporter;
@@ -19,6 +21,7 @@ use services::{build_services, SimulationError, SimulationRuntime};
 pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, SimulationError> {
     let system = domain::SimulationSystem::from_config(config);
     let services = build_services(config, &system);
+    let anomaly_injector = AnomalyInjector::from_config(&config.anomalies);
     let mut exporters: Vec<Arc<dyn TelemetryExporter>> = Vec::new();
     if config.exporters.prometheus.enabled {
         exporters.push(Arc::new(
@@ -50,6 +53,7 @@ pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, Simu
         services = services.len(),
         exporters = exporters.len(),
         simulator_stream = config.logging.simulator_stream.enabled,
+        anomaly_profiles = anomaly_injector.active_profile_count(),
         "simulation runtime assembled"
     );
     Ok(SimulationRuntime::new(
@@ -57,5 +61,6 @@ pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, Simu
         exporters,
         Duration::from_secs(config.runtime.shutdown_timeout_seconds),
         config.logging.simulator_stream.enabled,
+        anomaly_injector,
     ))
 }

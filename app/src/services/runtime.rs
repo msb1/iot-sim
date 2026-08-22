@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::anomalies::AnomalyInjector;
 use crate::export::{ExportError, TelemetryExporter};
 
 use super::base::{epoch_millis, SimulatorService};
@@ -15,6 +16,7 @@ pub struct SimulationRuntime {
     exporters: Vec<Arc<dyn TelemetryExporter>>,
     shutdown_timeout: std::time::Duration,
     simulator_stream_enabled: bool,
+    anomaly_injector: AnomalyInjector,
 }
 
 impl SimulationRuntime {
@@ -23,12 +25,14 @@ impl SimulationRuntime {
         exporters: Vec<Arc<dyn TelemetryExporter>>,
         shutdown_timeout: std::time::Duration,
         simulator_stream_enabled: bool,
+        anomaly_injector: AnomalyInjector,
     ) -> Self {
         Self {
             services,
             exporters,
             shutdown_timeout,
             simulator_stream_enabled,
+            anomaly_injector,
         }
     }
 
@@ -85,6 +89,7 @@ impl SimulationRuntime {
                 if readings.is_empty() {
                     continue;
                 }
+                self.anomaly_injector.inject(&mut readings);
                 tracing::debug!(count = readings.len(), "generated sensor readings");
                 if simulator_stream_enabled {
                     for reading in &readings {

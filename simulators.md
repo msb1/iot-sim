@@ -57,3 +57,29 @@ The hydraulics model maintains a shared tank volume. Inflow and outflow drive th
 Add a sensor entry under an entity in `config/simulation.yaml`, choose one of the existing `type` values, and set `id_prefix`, `quantity`, `timestep_ms`, `min_value`, and `max_value`. Sensors of an existing type use that type's configured model parameters. A completely new sensor type requires four additions: a `SensorType` value, configuration schema, a simulator service or existing-service mapping, and exporter-compatible metrics.
 
 For reliable analytics, keep `sensor_id` stable across runs and change only scenario/model parameters when you want a different signal profile. `entity_id` is also the Kafka key, so changing it changes Kafka partition affinity and ordering scope.
+
+## Anomaly injection
+
+The shared anomaly engine runs on `SensorReading` batches after every physical model has produced and clamped its baseline values. Because every service emits the same payload type, any metric from any of the 15 logical sensor types can be targeted without modifying that simulator. Exporters receive the altered readings through the normal telemetry contract.
+
+| Type | Scope | Configuration and behavior |
+| --- | --- | --- |
+| `spike` | Point | One target sample becomes `baseline * multiplier + offset`. |
+| `stuck_at` | Collective | Repeats an explicit `value`, or the last valid baseline value when `value` is omitted, for `duration_samples`. |
+| `drift` | Collective/trend | Adds a linear ramp from zero through `total_offset` across the active window. |
+| `noise` | Collective | Adds independent zero-mean Gaussian noise with standard deviation `sigma` for the active window. |
+| `contextual` | Contextual | Starts only while a condition on another sensor metric is true, then applies `value` (if supplied), `multiplier`, and `offset` for the active window. |
+
+Each profile has its own random activation check. A uniform draw greater than or equal to `trigger.threshold` starts an eligible event; high thresholds make events rare. `cooldown_samples` prevents immediate reactivation, and both cooldowns and active durations advance only when the target metric is emitted. Set `anomalies.seed` to reproduce activation and noise sequences.
+
+Context conditions support `greater_than`, `greater_than_or_equal`, `less_than`, `less_than_or_equal`, `equal`, and `not_equal`. The engine first snapshots the full current batch, so a condition does not depend on service ordering. When a correlated source is on a different cadence and absent from the batch, its latest unmodified baseline value is used. Active contextual windows finish their configured duration even if the initiating condition later clears.
+
+The sample configuration includes disabled-by-default profiles for:
+
+- a weather temperature spike;
+- a tank-level/load-cell correlation break;
+- pH calibration drift;
+- dissolved-oxygen freeze; and
+- sustained electrical voltage noise.
+
+Targets are validated at startup against the sensor's emitted metric names. This catches misspelled IDs or metrics before scheduling begins. Anomalies are intentionally applied after configured sensor bounds, so extreme values are not clipped and are useful for testing downstream detectors. They also carry no ground-truth flag in telemetry; activation details appear only in simulator logs.

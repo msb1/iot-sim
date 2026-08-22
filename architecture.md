@@ -17,6 +17,10 @@ YAML + environment overrides
                               │                         │
                        timestamped SensorReading         │
                               │                         │
+                              ▼                         │
+                    anomaly injector                   │
+                 (optional, stateful, seeded)           │
+                              │                         │
                  ┌────────────┴────────────┐            │
                  ▼                         ▼            │
        Prometheus scrape registry       Kafka JSON       │
@@ -52,7 +56,24 @@ pub trait SimulatorService: Send {
 
 Each `SensorSchedule` starts due immediately, then advances by that sensor's configured timestep. If a process wakes late, a schedule catches up to the next future deadline without creating a burst of historical readings. The service advances a coupled model once when any of its child sensors is due and emits only the child sensors that are due. This preserves shared state while allowing different sensor intervals.
 
-The runtime (`services/runtime.rs`) finds the earliest service deadline, sleeps through Tokio until that deadline, samples due services, then sends the resulting batch to every configured exporter. `RunningSimulation::stop` cancels this loop and waits up to the configured shutdown timeout.
+The runtime (`services/runtime.rs`) finds the earliest service deadline, sleeps through Tokio until that deadline, samples due services, applies the configured anomaly injector, then sends the resulting batch to every configured exporter. `RunningSimulation::stop` cancels this loop and waits up to the configured shutdown timeout.
+
+## Anomaly layer
+
+`app/src/anomalies.rs` is a stateful, transport-neutral middleware layer between sampling and export. An `AnomalyInjector` owns the seeded random generator, profile activation/cooldown state, and a cache of unmodified baseline metrics. Profiles implement the shared behavior contract:
+
+```rust
+pub trait AnomalyStrategy: Send {
+    fn duration_samples(&self) -> u64;
+    fn can_start(&self, context: &InjectionContext<'_>) -> bool;
+    fn start(&mut self, baseline: f64, previous: Option<f64>);
+    fn inject(&mut self, value: &mut f64, sample_index: u64, rng: &mut StdRng);
+}
+```
+
+The injector snapshots all baseline metrics in a scheduler batch before applying profiles. Contextual conditions can therefore inspect correlated values without depending on the order in which services or readings happen to be traversed. Its persistent baseline cache bridges sensors with different timesteps. The cache deliberately stores pre-injection values so a prior anomaly cannot become the reference for a later freeze or condition.
+
+The five concrete strategies cover spikes, freezes, linear drift, high-frequency Gaussian noise, and cross-stream contextual overrides. Triggering and cooldown behavior live in the profile wrapper rather than individual strategies, which gives every anomaly type the same rare-event semantics. Configuration validation resolves exact expanded sensor IDs and verifies metrics against the selected sensor type.
 
 ## Telemetry contract
 
@@ -77,7 +98,7 @@ async fn shutdown(&self) -> Result<(), ExportError>;
 
 ### Prometheus
 
-The Prometheus exporter owns a registry and serves it with Axum at the configured `bind` and `path` (the sample is `127.0.0.1:9898/metrics`). It exposes a single labeled gauge family, `iot_sensor_value`, plus timestamp and sequence gauge families. Metric identity is expressed by labels rather than generating a new Prometheus metric name for every sensor field:
+The Prometheus exporter owns a registry and serves it with Axum at the configured `bind` and `path` (the sample binds `0.0.0.0:9898/metrics`). It exposes a single labeled gauge family, `iot_sensor_value`, plus timestamp and sequence gauge families. Metric identity is expressed by labels rather than generating a new Prometheus metric name for every sensor field:
 
 `config_name`, `entity_type`, `entity_id`, `sensor_id`, `sensor_type`, and `metric`.
 
@@ -93,6 +114,7 @@ Kafka is behind Cargo's `kafka` feature to avoid making the default simulator bu
 | --- | --- |
 | `app/src/main.rs` | Parse configuration path and own process lifecycle. |
 | `app/src/config.rs` | Typed YAML/environment configuration and validation. |
+| `app/src/anomalies.rs` | Stateful point, contextual, freeze, drift, and noise injection. |
 | `app/src/impl/` | Facility, entity, and expanded sensor definitions. |
 | `app/src/models/` | Mathematical and physical simulation state. |
 | `app/src/services/` | Common scheduling trait, domain services, Tokio runtime. |

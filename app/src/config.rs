@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use config::{Config, ConfigError, Environment, File, FileFormat};
@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub exporters: ExportersConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub anomalies: AnomaliesConfig,
     pub models: ModelsConfig,
     pub entities: Vec<EntityConfig>,
 }
@@ -51,6 +53,7 @@ impl AppConfig {
 
         let mut entity_ids = HashSet::new();
         let mut sensor_ids = HashSet::new();
+        let mut sensor_types = HashMap::new();
         for entity in &self.entities {
             if !entity_ids.insert(&entity.entity_id) {
                 return Err(ConfigurationError::Validation(format!(
@@ -90,9 +93,12 @@ impl AppConfig {
                             "duplicate expanded sensor_id '{id}'"
                         )));
                     }
+                    sensor_types.insert(id, sensor.sensor_type);
                 }
             }
         }
+
+        self.anomalies.validate(&sensor_types)?;
 
         if self.exporters.prometheus.enabled && self.exporters.prometheus.bind.trim().is_empty() {
             return Err(ConfigurationError::Validation(
@@ -161,6 +167,247 @@ impl Default for RuntimeConfig {
 
 fn default_shutdown_timeout() -> u64 {
     10
+}
+
+/// Post-model anomaly injection. The baseline simulators are unchanged when
+/// this section is omitted or `enabled` is false.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnomaliesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// A fixed seed makes random anomaly activation and noise reproducible.
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub profiles: Vec<AnomalyProfileConfig>,
+}
+
+impl AnomaliesConfig {
+    fn validate(
+        &self,
+        sensor_types: &HashMap<String, SensorType>,
+    ) -> Result<(), ConfigurationError> {
+        let mut names = HashSet::new();
+        for profile in &self.profiles {
+            if profile.name.trim().is_empty() {
+                return Err(ConfigurationError::Validation(
+                    "anomaly profile name cannot be empty".into(),
+                ));
+            }
+            if !names.insert(&profile.name) {
+                return Err(ConfigurationError::Validation(format!(
+                    "duplicate anomaly profile name '{}'",
+                    profile.name
+                )));
+            }
+            validate_anomaly_target(&profile.name, &profile.target, sensor_types)?;
+            if !profile.trigger.threshold.is_finite()
+                || !(0.0..=1.0).contains(&profile.trigger.threshold)
+            {
+                return Err(ConfigurationError::Validation(format!(
+                    "anomaly profile '{}' trigger.threshold must be between 0 and 1",
+                    profile.name
+                )));
+            }
+            profile.strategy.validate(&profile.name, sensor_types)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_anomaly_target(
+    profile_name: &str,
+    target: &AnomalyTargetConfig,
+    sensor_types: &HashMap<String, SensorType>,
+) -> Result<(), ConfigurationError> {
+    let Some(sensor_type) = sensor_types.get(&target.sensor_id) else {
+        return Err(ConfigurationError::Validation(format!(
+            "anomaly profile '{profile_name}' references unknown sensor_id '{}'",
+            target.sensor_id
+        )));
+    };
+    if !sensor_type.metric_names().contains(&target.metric.as_str()) {
+        return Err(ConfigurationError::Validation(format!(
+            "anomaly profile '{profile_name}' metric '{}' is not emitted by sensor '{}'",
+            target.metric, target.sensor_id
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnomalyProfileConfig {
+    pub name: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    pub target: AnomalyTargetConfig,
+    #[serde(default)]
+    pub trigger: AnomalyTriggerConfig,
+    #[serde(flatten)]
+    pub strategy: AnomalyStrategyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct AnomalyTargetConfig {
+    pub sensor_id: String,
+    pub metric: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnomalyTriggerConfig {
+    /// An event starts when a uniform random value in [0, 1) is greater than
+    /// or equal to this threshold. High values therefore make anomalies rare.
+    #[serde(default = "default_anomaly_threshold")]
+    pub threshold: f64,
+    #[serde(default)]
+    pub cooldown_samples: u64,
+}
+
+impl Default for AnomalyTriggerConfig {
+    fn default() -> Self {
+        Self {
+            threshold: default_anomaly_threshold(),
+            cooldown_samples: 0,
+        }
+    }
+}
+
+fn default_anomaly_threshold() -> f64 {
+    0.999
+}
+
+fn default_multiplier() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnomalyStrategyConfig {
+    Spike {
+        #[serde(default)]
+        offset: f64,
+        #[serde(default = "default_multiplier")]
+        multiplier: f64,
+    },
+    StuckAt {
+        duration_samples: u64,
+        /// Omit to freeze at the last valid value observed before activation.
+        value: Option<f64>,
+    },
+    Drift {
+        duration_samples: u64,
+        total_offset: f64,
+    },
+    Noise {
+        duration_samples: u64,
+        sigma: f64,
+    },
+    Contextual {
+        duration_samples: u64,
+        condition: AnomalyConditionConfig,
+        value: Option<f64>,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default = "default_multiplier")]
+        multiplier: f64,
+    },
+}
+
+impl AnomalyStrategyConfig {
+    fn validate(
+        &self,
+        profile_name: &str,
+        sensor_types: &HashMap<String, SensorType>,
+    ) -> Result<(), ConfigurationError> {
+        let invalid_duration = match self {
+            Self::Spike { .. } => false,
+            Self::StuckAt {
+                duration_samples, ..
+            }
+            | Self::Drift {
+                duration_samples, ..
+            }
+            | Self::Noise {
+                duration_samples, ..
+            }
+            | Self::Contextual {
+                duration_samples, ..
+            } => *duration_samples == 0,
+        };
+        if invalid_duration {
+            return Err(ConfigurationError::Validation(format!(
+                "anomaly profile '{profile_name}' duration_samples must be greater than zero"
+            )));
+        }
+
+        match self {
+            Self::Spike { offset, multiplier } => {
+                validate_finite(profile_name, "offset", *offset)?;
+                validate_finite(profile_name, "multiplier", *multiplier)?;
+            }
+            Self::StuckAt { value, .. } => {
+                if let Some(value) = value {
+                    validate_finite(profile_name, "value", *value)?;
+                }
+            }
+            Self::Drift { total_offset, .. } => {
+                validate_finite(profile_name, "total_offset", *total_offset)?;
+            }
+            Self::Noise { sigma, .. } => {
+                if !sigma.is_finite() || *sigma <= 0.0 {
+                    return Err(ConfigurationError::Validation(format!(
+                        "anomaly profile '{profile_name}' sigma must be finite and greater than zero"
+                    )));
+                }
+            }
+            Self::Contextual {
+                condition,
+                value,
+                offset,
+                multiplier,
+                ..
+            } => {
+                validate_anomaly_target(profile_name, &condition.source, sensor_types)?;
+                validate_finite(profile_name, "condition.value", condition.value)?;
+                if let Some(value) = value {
+                    validate_finite(profile_name, "value", *value)?;
+                }
+                validate_finite(profile_name, "offset", *offset)?;
+                validate_finite(profile_name, "multiplier", *multiplier)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_finite(
+    profile_name: &str,
+    field_name: &str,
+    value: f64,
+) -> Result<(), ConfigurationError> {
+    if !value.is_finite() {
+        return Err(ConfigurationError::Validation(format!(
+            "anomaly profile '{profile_name}' {field_name} must be finite"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnomalyConditionConfig {
+    pub source: AnomalyTargetConfig,
+    pub operator: ComparisonOperator,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOperator {
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Equal,
+    NotEqual,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -325,6 +572,58 @@ impl SensorType {
         Self::MassFlow,
         Self::LoadCell,
     ];
+
+    pub fn metric_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Weather => &["temperature_c", "humidity_pct", "pressure_hpa"],
+            Self::Sound => &["decibels_db"],
+            Self::Electrical => &[
+                "voltage_a_v",
+                "current_a_a",
+                "power_a_kw",
+                "apparent_power_a_kva",
+                "power_factor_a",
+                "voltage_thd_a_pct",
+                "active_energy_a_kwh",
+                "apparent_energy_a_kvah",
+                "voltage_b_v",
+                "current_b_a",
+                "power_b_kw",
+                "apparent_power_b_kva",
+                "power_factor_b",
+                "voltage_thd_b_pct",
+                "active_energy_b_kwh",
+                "apparent_energy_b_kvah",
+                "voltage_c_v",
+                "current_c_a",
+                "power_c_kw",
+                "apparent_power_c_kva",
+                "power_factor_c",
+                "voltage_thd_c_pct",
+                "active_energy_c_kwh",
+                "apparent_energy_c_kvah",
+                "safety_relay_tripped",
+            ],
+            Self::Ph => &["ph_units"],
+            Self::Orp => &["orp_mv"],
+            Self::Conductivity => &["conductivity_ms_cm"],
+            Self::ChemicalConcentration => &["concentration_mol_l"],
+            Self::ProcessAnalyticsFtir => &[
+                "absorbance_lambda_1",
+                "absorbance_lambda_2",
+                "absorbance_lambda_3",
+                "absorbance_lambda_4",
+                "optical_path_length_cm",
+            ],
+            Self::DissolvedOxygen => &["dissolved_oxygen_mg_l"],
+            Self::ToxicGas => &["carbon_monoxide_co_ppm", "sensor_health_warning"],
+            Self::CombustibleGas => &["combustible_gas_lel_pct"],
+            Self::Photoionization => &["voc_pid_ppm"],
+            Self::Level => &["tank_level_pct", "fluid_volume_liters"],
+            Self::MassFlow => &["mass_flow_rate_l_min"],
+            Self::LoadCell => &["load_cell_weight_kg", "mixer_active"],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -459,7 +758,7 @@ pub struct HydraulicsModelConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, ConfigurationError};
 
     #[test]
     fn sample_configuration_loads_and_defines_all_sensor_types() {
@@ -471,5 +770,27 @@ mod tests {
             .sum();
         assert_eq!(count, 15);
         assert_eq!(config.entities.len(), 5);
+        assert_eq!(config.anomalies.profiles.len(), 5);
+    }
+
+    #[test]
+    fn anomaly_target_metric_must_belong_to_its_sensor() {
+        let mut config = AppConfig::load(super::sample_config_path()).unwrap();
+        config.anomalies.profiles[0].target.metric = "not_a_weather_metric".into();
+
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, ConfigurationError::Validation(_)));
+        assert!(error
+            .to_string()
+            .contains("not emitted by sensor 'weather-01'"));
+    }
+
+    #[test]
+    fn anomaly_threshold_must_be_a_probability_boundary() {
+        let mut config = AppConfig::load(super::sample_config_path()).unwrap();
+        config.anomalies.profiles[0].trigger.threshold = 1.01;
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("must be between 0 and 1"));
     }
 }

@@ -1,6 +1,6 @@
 # iot-sim
 
-`iot-sim` is an asynchronous Rust simulator for analytics development and integration testing. It produces 15 logical IoT sensors attached to five industrial entities, schedules each sensor at its own configured interval, and exports timestamped telemetry to Prometheus and Kafka.
+`iot-sim` is an asynchronous Rust simulator for analytics development and integration testing. It produces 15 logical IoT sensors attached to five industrial entities, schedules each sensor at its own configured interval, can inject point/contextual/collective anomalies, and exports timestamped telemetry to Prometheus and Kafka.
 
 Read [architecture.md](architecture.md) for the component design and data flow, and [simulators.md](simulators.md) for the simulator and sensor inventory.
 
@@ -13,7 +13,7 @@ Read [architecture.md](architecture.md) for the component design and data flow, 
 
 ## Run locally
 
-The supplied configuration starts the Prometheus exporter on `127.0.0.1:9898` and leaves Kafka disabled.
+The supplied configuration starts the Prometheus exporter on `0.0.0.0:9898` and enables Kafka for the broker addresses in the file. Override `IOT_SIM__EXPORTERS__KAFKA__ENABLED=false` when running without those brokers.
 
 ```bash
 cargo run -- --config config/simulation.yaml
@@ -44,6 +44,34 @@ logging:
 ```
 
 Every generated sensor reading is then logged as JSON at `INFO` level. It can also be enabled without changing the file with `IOT_SIM__LOGGING__SIMULATOR_STREAM__ENABLED=true`. Lifecycle logs identify enabled services and exporters; set `RUST_LOG=iot_sim=debug` to additionally see each Prometheus update and confirmed Kafka record delivery.
+
+## Inject anomalies
+
+Anomaly injection is globally off in the supplied configuration. Enable it in a scenario copy with:
+
+```yaml
+anomalies:
+  enabled: true
+  seed: 42                 # omit for a different scenario on each start
+  profiles:
+    - name: "temperature_spike"
+      enabled: true
+      type: "spike"
+      target:
+        sensor_id: "weather-01"
+        metric: "temperature_c"
+      trigger:
+        threshold: 0.999   # event starts when random [0,1) >= threshold
+        cooldown_samples: 100
+      offset: 70.0
+      multiplier: 1.0
+```
+
+Every enabled profile evaluates its trigger only when its exact target metric is emitted. Thus `threshold: 0.999` gives approximately a 0.1% activation chance per target sample, `0` always activates when eligible, and `1` never activates. `cooldown_samples` counts later target emissions after an event. A fixed `seed` makes trigger decisions and Gaussian noise repeatable.
+
+The available profile types are `spike`, `stuck_at`, `drift`, `noise`, and `contextual`. Multi-sample durations are measured in emissions of the target sensor, not wall-clock seconds. A `stuck_at` profile with no `value` captures the last valid baseline reading; a contextual profile evaluates another sensor/metric from the current scheduler batch or its latest cached baseline. See the fully annotated profiles in [config/simulation.yaml](config/simulation.yaml) and detailed semantics in [simulators.md](simulators.md).
+
+Injection occurs after normal sensor-bound clamping, intentionally allowing an anomaly to exceed `min_value` or `max_value`. The telemetry schema is unchanged and readings are not labeled as anomalous, so downstream detection systems receive the same contract in baseline and anomaly scenarios. Each activation is recorded in the simulator log with its profile, sensor, metric, and duration.
 
 ## Test the Prometheus integration
 
@@ -120,9 +148,9 @@ The producer uses idempotence and `acks=all`. The default topic is deliberately 
 
 ## Configuration
 
-[config/simulation.yaml](config/simulation.yaml) defines entities, sensors, model operating parameters, exporter settings, and lifecycle controls.
+[config/simulation.yaml](config/simulation.yaml) defines entities, sensors, model operating parameters, anomaly profiles, exporter settings, and lifecycle controls.
 
-Each logical sensor has an ID prefix, quantity, enabled flag, output bounds, and `timestep_ms`. A quantity greater than one expands IDs as `<id_prefix>-01`, `<id_prefix>-02`, and so on. Startup validates duplicate entity IDs, duplicate expanded sensor IDs, zero timesteps, invalid bounds, and exporter prerequisites.
+Each logical sensor has an ID prefix, quantity, enabled flag, output bounds, and `timestep_ms`. A quantity greater than one expands IDs as `<id_prefix>-01`, `<id_prefix>-02`, and so on. Startup validates duplicate entity IDs, duplicate expanded sensor IDs, zero timesteps, invalid bounds, exporter prerequisites, anomaly thresholds/durations, and anomaly sensor/metric references.
 
 The coupled physical models are preserved even when their child sensor intervals differ: concentration and FTIR share a process state; the four gas sensors share an environmental-safety state; and level, flow, and load-cell share tank-hydraulics state.
 

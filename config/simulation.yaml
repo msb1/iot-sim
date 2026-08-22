@@ -12,6 +12,88 @@ logging:
   simulator_stream:
     enabled: true
 
+# Anomalies are injected after baseline model sampling and before every
+# exporter. Keep the global switch false for normal simulation. Each enabled
+# profile runs its own random event check whenever its target metric is emitted;
+# an event starts when the random value is >= threshold (0.999 = about 0.1%).
+anomalies:
+  enabled: false
+  # Set a seed for repeatable activation decisions and noise values. Omit it
+  # when a different random scenario is wanted on every process start.
+  seed: 42
+  profiles:
+    # Point anomaly: one extreme outdoor-temperature sample.
+    - name: "weather_temperature_spike"
+      enabled: true
+      type: "spike"
+      target:
+        sensor_id: "weather-01"
+        metric: "temperature_c"
+      trigger:
+        threshold: 0.999
+        cooldown_samples: 100
+      offset: 70.0
+      multiplier: 1.0
+
+    # Contextual anomaly: report an almost empty tank only while the independent
+    # load cell still indicates substantial mass.
+    - name: "hydraulics_correlation_break"
+      enabled: true
+      type: "contextual"
+      target:
+        sensor_id: "level-01"
+        metric: "tank_level_pct"
+      trigger:
+        threshold: 0.999
+        cooldown_samples: 100
+      duration_samples: 3
+      condition:
+        source:
+          sensor_id: "load-01"
+          metric: "load_cell_weight_kg"
+        operator: "greater_than"
+        value: 900.0
+      value: 2.0
+
+    # Collective anomaly: pH calibration progressively drifts downward.
+    - name: "ph_calibration_drift"
+      enabled: true
+      type: "drift"
+      target:
+        sensor_id: "ph-01"
+        metric: "ph_units"
+      trigger:
+        threshold: 0.999
+        cooldown_samples: 100
+      duration_samples: 30
+      total_offset: -2.0
+
+    # Collective anomaly: dissolved-oxygen membrane output freezes at its last
+    # valid reading for ten target samples.
+    - name: "dissolved_oxygen_freeze"
+      enabled: true
+      type: "stuck_at"
+      target:
+        sensor_id: "do-01"
+        metric: "dissolved_oxygen_mg_l"
+      trigger:
+        threshold: 0.999
+        cooldown_samples: 100
+      duration_samples: 10
+
+    # Collective anomaly: sustained high-frequency voltage noise.
+    - name: "electrical_voltage_noise"
+      enabled: true
+      type: "noise"
+      target:
+        sensor_id: "elec-01"
+        metric: "voltage_a_v"
+      trigger:
+        threshold: 0.999
+        cooldown_samples: 100
+      duration_samples: 20
+      sigma: 15.0
+
 exporters:
   prometheus:
     enabled: true
