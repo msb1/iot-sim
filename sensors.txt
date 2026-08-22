@@ -1,0 +1,16 @@
+ The 15 simulated sensors:
+ 1. Weather (temperature, humidity, pressure)
+ 2. Sound (decibels with occasional spikes)
+ 3. Electrical (voltage, current, power)
+ 4. pH measurement
+ 5. ORP (oxidation-reduction potential)
+ 6. Conductivity
+ 7. Chemical concentration
+ 8. Spectroscopic (FTIR array)
+ 9. Dissolved oxygen
+ 10. Toxic gas (CO)
+ 11. Combustible gas (LEL)
+ 12. VOC (Photoionization)
+ 13. Level (fluid tank)
+ 14. Mass flow
+ 15. Load cell (weight with sine wave pattern)

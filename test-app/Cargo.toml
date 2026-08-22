@@ -1,0 +1,13 @@
+[package]
+name = "test-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kafka-test"
+path = "src/kafka-test.rs"
+
+[dependencies]
+iot-sim = { path = "../app", features = ["kafka"] }
+rdkafka = { version = "0.38", features = ["dynamic-linking", "tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
