@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anomalies::AnomalyInjector;
+use chrono::DateTime;
 use config::AppConfig;
+use export::dataset::DatasetExporter;
 #[cfg(feature = "kafka")]
 use export::kafka::KafkaExporter;
 use export::prometheus::PrometheusExporter;
@@ -23,6 +25,22 @@ pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, Simu
     let services = build_services(config, &system);
     let anomaly_injector = AnomalyInjector::from_config(&config.anomalies);
     let mut exporters: Vec<Arc<dyn TelemetryExporter>> = Vec::new();
+    let dataset_start_ms = if config.exporters.dataset.enabled {
+        Some(
+            DateTime::parse_from_rfc3339(
+                config
+                    .exporters
+                    .dataset
+                    .start_time
+                    .as_deref()
+                    .expect("validated dataset start time"),
+            )
+            .expect("validated dataset start time")
+            .timestamp_millis(),
+        )
+    } else {
+        None
+    };
     if config.exporters.prometheus.enabled {
         exporters.push(Arc::new(
             PrometheusExporter::new(
@@ -48,6 +66,16 @@ pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, Simu
         #[cfg(not(feature = "kafka"))]
         return Err(SimulationError::KafkaFeatureDisabled);
     }
+    if let Some(start_ms) = dataset_start_ms {
+        exporters.push(Arc::new(
+            DatasetExporter::new(config.exporters.dataset.clone(), start_ms).map_err(|source| {
+                SimulationError::Exporter {
+                    exporter: "dataset",
+                    source,
+                }
+            })?,
+        ));
+    }
     tracing::info!(
         config = %config.config_name,
         services = services.len(),
@@ -62,5 +90,6 @@ pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, Simu
         Duration::from_secs(config.runtime.shutdown_timeout_seconds),
         config.logging.simulator_stream.enabled,
         anomaly_injector,
+        dataset_start_ms,
     ))
 }

@@ -67,6 +67,7 @@ impl TelemetryExporter for KafkaExporter {
                     sensor_id: &reading.sensor_id,
                     sensor_type: reading.sensor_type,
                     timestamp_ms: reading.timestamp_ms,
+                    interval_ms: reading.interval_ms,
                     metric,
                     value: *value,
                 };

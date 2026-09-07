@@ -4,6 +4,22 @@
 
 The project separates physical simulation, scheduling, telemetry representation, and transport. A model can evolve without changing exporters; an exporter can change from JSON to Protobuf without changing sensor cadence or physical state.
 
+## Configurable industrial scenario signals
+
+Alongside the original fixed physical models, `scenario_signal` supplies one
+named engineering metric with configured bounds, cadence, baseline, noise seed,
+and optional constant, sine, step-cycle, or batch-temperature waveform.
+`ScenarioService` schedules each instance independently and emits the same
+transport-neutral `SensorReading` as every established service. The original
+sensor types and implementations remain available.
+
+Anomaly injection remains downstream of all baseline services. Triggers now
+support deterministic `start_after_samples` warm-up; `spike_drop` models a
+two-sample pressure impulse/collapse; and `batch_cooling_stretch` emits batch
+curves whose cooling duration grows across batches. Contextual profiles read
+synchronized companion signals from the current scheduler batch, falling back
+to the last baseline value when cadences do not coincide.
+
 ```text
 YAML + environment overrides
             │
@@ -84,7 +100,9 @@ The five concrete strategies cover spikes, freezes, linear drift, high-frequency
 - `sequence`: monotonically increasing per sensor;
 - `metrics`: a named numeric map.
 
-Kafka emits one compact message per metric. The JSON form is defined in [schemas/entity-telemetry.schema.json](schemas/entity-telemetry.schema.json): sensor identity, timestamp, metric name, and numeric value. Kafka-specific headers are not duplicated in the value.
+Kafka emits one compact message per metric. The JSON form is defined in [schemas/entity-telemetry.schema.json](schemas/entity-telemetry.schema.json): sensor identity, timestamp, configured send interval in milliseconds, metric name, and numeric value. Kafka-specific headers are not duplicated in the value.
+
+When `exporters.dataset.enabled` is set, the runtime selects its finite historical execution path. It starts at `exporters.dataset.start_time` and advances the same services and anomaly injector through every due sample until the real current instant. It uses a virtual monotonic scheduler only to evolve model state efficiently; `SensorReading.timestamp_ms` is always the corresponding real historical epoch time. Dataset mode is exclusive with Kafka and Prometheus, and its exporter flattens every reading into labeled metric rows in one Snappy Parquet file per dataset run, uploaded to `s3://iotsim/dataset/<first-entity-id>-<ISO-8601-start-time>.parquet` through the configured RustFS-compatible endpoint.
 
 ## Exporters
 

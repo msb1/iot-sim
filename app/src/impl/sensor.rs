@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::config::{SensorConfig, SensorType};
+use crate::config::{DataCenterRackConfig, ScenarioSignalConfig, SensorConfig, SensorType};
 
 #[derive(Debug, Clone)]
 pub struct IoTSensor {
@@ -9,6 +9,8 @@ pub struct IoTSensor {
     pub timestep: Duration,
     pub min_value: f64,
     pub max_value: f64,
+    pub scenario: Option<ScenarioSignalConfig>,
+    pub data_center_rack: Option<DataCenterRackConfig>,
 }
 
 impl IoTSensor {
@@ -19,6 +21,8 @@ impl IoTSensor {
             timestep: Duration::from_millis(config.timestep_ms),
             min_value: config.min_value,
             max_value: config.max_value,
+            scenario: config.scenario.clone(),
+            data_center_rack: config.data_center_rack.clone(),
         }
     }
 

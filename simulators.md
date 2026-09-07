@@ -1,6 +1,6 @@
 # Simulators and sensors
 
-The configuration defines 15 logical sensor types. Some are individual models and some are output channels of a shared, coupled physical model. A logical sensor can be replicated with `quantity`; the sample facility currently configures one instance of each type.
+The configuration defines 17 logical sensor types. Some are individual models and some are output channels of a shared, coupled physical model. A logical sensor can be replicated with `quantity`; the sample facility currently configures one instance of each type.
 
 ## Inventory
 
@@ -21,6 +21,7 @@ The configuration defines 15 logical sensor types. Some are individual models an
 | Hydraulics service / tank model | `mixing_tank_01` | Level | `level-01` | 2,000 ms | `tank_level_pct`, `fluid_volume_liters` |
 | Hydraulics service / tank model | `mixing_tank_01` | Mass flow | `flow-01` | 1,000 ms | `mass_flow_rate_l_min` |
 | Hydraulics service / tank model | `mixing_tank_01` | Load cell | `load-01` | 2,500 ms | `load_cell_weight_kg`, `mixer_active` |
+| Data-center rack service / correlated physical model | `data_center_rack_01` | Data-center rack | `rack-telemetry-01` | ~104 ms wall-clock in test mode (96 points per 10-second simulated day) | `cpu_utilization`, `temperature_f`, `relative_humidity_pct`, `day_of_week` |
 
 ## Simulator behavior
 

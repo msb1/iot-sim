@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config = %config.config_name,
         prometheus_enabled = config.exporters.prometheus.enabled,
         kafka_enabled = config.exporters.kafka.enabled,
+        dataset_enabled = config.exporters.dataset.enabled,
         simulator_stream = config.logging.simulator_stream.enabled,
         "configuration loaded and validated"
     );
@@ -27,7 +28,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let running = iot_sim::build_runtime(&config).await?.start().await?;
     tracing::info!(config = %config.config_name, sensors = config.entities.iter().map(|e| e.sensors.iter().map(|s| s.quantity).sum::<usize>()).sum::<usize>(), "simulation started");
 
-    if let Some(seconds) = duration {
+    if config.exporters.dataset.enabled {
+        running.wait().await?;
+        tracing::info!("dataset generation completed cleanly");
+        return Ok(());
+    } else if let Some(seconds) = duration {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
             result = tokio::signal::ctrl_c() => result?,

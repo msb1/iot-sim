@@ -1,4 +1,5 @@
 pub mod base;
+mod data_center_rack;
 mod electrical;
 mod electrochemistry;
 mod environment;
@@ -6,6 +7,7 @@ mod gas;
 mod hydraulics;
 mod process;
 mod runtime;
+mod scenario;
 
 pub use base::SimulatorService;
 pub use runtime::{RunningSimulation, SimulationError, SimulationRuntime};
@@ -16,12 +18,14 @@ use std::time::Instant;
 use crate::config::{AppConfig, SensorType};
 use crate::domain::{ScheduledSensor, SimulationSystem};
 
+use data_center_rack::DataCenterRackService;
 use electrical::ElectricalService;
 use electrochemistry::ElectrochemistryService;
 use environment::{SoundService, WeatherService};
 use gas::GasSafetyService;
 use hydraulics::HydraulicsService;
 use process::ProcessService;
+use scenario::ScenarioService;
 
 pub fn build_services(
     config: &AppConfig,
@@ -45,6 +49,8 @@ pub fn build_services(
     let level = take(SensorType::Level);
     let flow = take(SensorType::MassFlow);
     let load = take(SensorType::LoadCell);
+    let scenario = take(SensorType::ScenarioSignal);
+    let data_center_rack = take(SensorType::DataCenterRack);
 
     let mut services: Vec<Box<dyn SimulatorService>> = Vec::new();
     if !weather.is_empty() {
@@ -100,6 +106,16 @@ pub fn build_services(
             &config.models.hydraulics,
             [level, flow, load],
             start,
+        )));
+    }
+    if !scenario.is_empty() {
+        services.push(Box::new(ScenarioService::new(scenario, start)));
+    }
+    if !data_center_rack.is_empty() {
+        services.push(Box::new(DataCenterRackService::new(
+            data_center_rack,
+            start,
+            config.exporters.dataset.enabled,
         )));
     }
     for service in &services {

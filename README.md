@@ -1,8 +1,11 @@
 # iot-sim
 
-`iot-sim` is an asynchronous Rust simulator for analytics development and integration testing. It produces 15 logical IoT sensors attached to five industrial entities, schedules each sensor at its own configured interval, can inject point/contextual/collective anomalies, and exports timestamped telemetry to Prometheus and Kafka.
+`iot-sim` is an asynchronous Rust simulator for analytics development and integration testing. It retains its original 15 fixed sensor types and adds configurable industrial scenario signals, schedules every enabled sensor at its own interval, can inject point/contextual/collective anomalies, and exports timestamped telemetry to Prometheus, Kafka, or a historical Parquet dataset in S3-compatible storage.
 
-Read [architecture.md](architecture.md) for the component design and data flow, and [simulators.md](simulators.md) for the simulator and sensor inventory.
+Read [architecture.md](architecture.md) for the component design and data flow,
+[simulators.md](simulators.md) for the original simulator inventory, and
+[simulated-scenarios.md](simulated-scenarios.md) for the water, data-center,
+cleanroom, refinery, and reactor anomaly workload.
 
 ## Prerequisites
 
@@ -142,15 +145,38 @@ Each record uses:
 
 - key: the stable `entity_id`, so all messages for an entity are partitioned and ordered together;
 - headers: `entity_id`, `sensor_id`, `sensor_type`, and `metric`;
-- value: one compact JSON message per sensor metric: `entity_type`, `entity_id`, `sensor_id`, `sensor_type`, `timestamp_ms`, `metric`, and numeric `value`. The value never contains Kafka headers.
+- value: one compact JSON message per sensor metric: `entity_type`, `entity_id`, `sensor_id`, `sensor_type`, `timestamp_ms`, positive `interval_ms`, `metric`, and numeric `value`. The value never contains Kafka headers.
 
 The producer uses idempotence and `acks=all`. The default topic is deliberately multi-tenant (`iot.telemetry.v1`) rather than one topic per sensor. The message schema is [schemas/entity-telemetry.schema.json](schemas/entity-telemetry.schema.json).
+
+## Generate a historical dataset
+
+Enable the `dataset` exporter to generate a finite dataset from an RFC 3339 `start_time` through the real time at process start. The scheduler advances every model using its configured cadence, but each output record receives its true historical source timestamp; it does not emit accelerated test timestamps. Enabled anomaly profiles are injected through the same path as streaming mode.
+
+Dataset mode is exclusive: both Kafka and Prometheus must be disabled. It writes all simulated data for a run to one Snappy-compressed, long-form Parquet object under `dataset/` in the configured bucket. The filename is `<entity-id>-<ISO-8601-start-time>.parquet`, using the first emitted entity ID, so each simulator dataset is identifiable.
+
+```yaml
+exporters:
+  prometheus: { enabled: false }
+  kafka: { enabled: false }
+  dataset:
+    enabled: true
+    start_time: "2026-08-01T00:00:00Z"
+    s3_endpoint_url: "http://192.168.1.50:9000"
+    s3_bucket_name: "iotsim"
+    s3_access_key: "access"
+    s3_secret_key: "secret"
+```
+
+Run it normally with that configuration. Completion uploads one object, for example `dataset/data_center_rack_01-2026-08-01T00:00:00Z.parquet`, to RustFS and exits. The target bucket must already exist and the configured credentials must have `PutObject` permission. For deployments, override S3 credentials with `IOT_SIM__EXPORTERS__DATASET__S3_ACCESS_KEY` and `IOT_SIM__EXPORTERS__DATASET__S3_SECRET_KEY` instead of storing credentials in YAML.
+
+Each Parquet row represents one sensor metric and is labeled with `entity_type`, `entity_id`, `sensor_id`, `sensor_type`, `timestamp_ms`, `interval_ms`, `sequence`, `metric`, and `value`.
 
 ## Configuration
 
 [config/simulation.yaml](config/simulation.yaml) defines entities, sensors, model operating parameters, anomaly profiles, exporter settings, and lifecycle controls.
 
-Each logical sensor has an ID prefix, quantity, enabled flag, output bounds, and `timestep_ms`. A quantity greater than one expands IDs as `<id_prefix>-01`, `<id_prefix>-02`, and so on. Startup validates duplicate entity IDs, duplicate expanded sensor IDs, zero timesteps, invalid bounds, exporter prerequisites, anomaly thresholds/durations, and anomaly sensor/metric references.
+Each logical sensor has an ID prefix, quantity, enabled flag, output bounds, and `timestep_ms`. A quantity greater than one expands IDs as `<id_prefix>-01`, `<id_prefix>-02`, and so on. Startup validates duplicate entity IDs, duplicate expanded sensor IDs, zero timesteps, invalid bounds, exporter prerequisites, anomaly thresholds/durations, anomaly sensor/metric references, dataset start dates, and the exclusive dataset-exporter rule.
 
 The coupled physical models are preserved even when their child sensor intervals differ: concentration and FTIR share a process state; the four gas sensors share an environmental-safety state; and level, flow, and load-cell share tank-hydraulics state.
 

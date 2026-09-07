@@ -53,7 +53,7 @@ impl AppConfig {
 
         let mut entity_ids = HashSet::new();
         let mut sensor_ids = HashSet::new();
-        let mut sensor_types = HashMap::new();
+        let mut sensor_metrics = HashMap::new();
         for entity in &self.entities {
             if !entity_ids.insert(&entity.entity_id) {
                 return Err(ConfigurationError::Validation(format!(
@@ -93,12 +93,48 @@ impl AppConfig {
                             "duplicate expanded sensor_id '{id}'"
                         )));
                     }
-                    sensor_types.insert(id, sensor.sensor_type);
+                    let metrics = if sensor.sensor_type == SensorType::ScenarioSignal {
+                        let signal = sensor.scenario.as_ref().ok_or_else(|| {
+                            ConfigurationError::Validation(format!(
+                                "scenario_signal sensor '{}' requires a scenario block",
+                                sensor.id_prefix
+                            ))
+                        })?;
+                        signal.validate(&sensor.id_prefix)?;
+                        HashSet::from([signal.metric.clone()])
+                    } else {
+                        if sensor.scenario.is_some() {
+                            return Err(ConfigurationError::Validation(format!(
+                                "sensor '{}' may only use scenario with type scenario_signal",
+                                sensor.id_prefix
+                            )));
+                        }
+                        if sensor.sensor_type == SensorType::DataCenterRack {
+                            sensor.data_center_rack.as_ref().ok_or_else(|| {
+                                ConfigurationError::Validation(format!(
+                                    "data_center_rack sensor '{}' requires a data_center_rack block",
+                                    sensor.id_prefix
+                                ))
+                            })?.validate(&sensor.id_prefix)?;
+                        } else if sensor.data_center_rack.is_some() {
+                            return Err(ConfigurationError::Validation(format!(
+                                "sensor '{}' may only use data_center_rack with type data_center_rack",
+                                sensor.id_prefix
+                            )));
+                        }
+                        sensor
+                            .sensor_type
+                            .metric_names()
+                            .iter()
+                            .map(|metric| (*metric).to_string())
+                            .collect()
+                    };
+                    sensor_metrics.insert(id, metrics);
                 }
             }
         }
 
-        self.anomalies.validate(&sensor_types)?;
+        self.anomalies.validate(&sensor_metrics)?;
 
         if self.exporters.prometheus.enabled && self.exporters.prometheus.bind.trim().is_empty() {
             return Err(ConfigurationError::Validation(
@@ -116,6 +152,14 @@ impl AppConfig {
                     "exporters.kafka.topic cannot be empty when Kafka is enabled".into(),
                 ));
             }
+        }
+        if self.exporters.dataset.enabled {
+            if self.exporters.kafka.enabled || self.exporters.prometheus.enabled {
+                return Err(ConfigurationError::Validation(
+                    "dataset exporter cannot be enabled with Kafka or Prometheus exporters".into(),
+                ));
+            }
+            self.exporters.dataset.validate()?;
         }
         Ok(())
     }
@@ -184,7 +228,7 @@ pub struct AnomaliesConfig {
 impl AnomaliesConfig {
     fn validate(
         &self,
-        sensor_types: &HashMap<String, SensorType>,
+        sensor_metrics: &HashMap<String, HashSet<String>>,
     ) -> Result<(), ConfigurationError> {
         let mut names = HashSet::new();
         for profile in &self.profiles {
@@ -199,7 +243,7 @@ impl AnomaliesConfig {
                     profile.name
                 )));
             }
-            validate_anomaly_target(&profile.name, &profile.target, sensor_types)?;
+            validate_anomaly_target(&profile.name, &profile.target, sensor_metrics)?;
             if !profile.trigger.threshold.is_finite()
                 || !(0.0..=1.0).contains(&profile.trigger.threshold)
             {
@@ -208,7 +252,7 @@ impl AnomaliesConfig {
                     profile.name
                 )));
             }
-            profile.strategy.validate(&profile.name, sensor_types)?;
+            profile.strategy.validate(&profile.name, sensor_metrics)?;
         }
         Ok(())
     }
@@ -217,15 +261,15 @@ impl AnomaliesConfig {
 fn validate_anomaly_target(
     profile_name: &str,
     target: &AnomalyTargetConfig,
-    sensor_types: &HashMap<String, SensorType>,
+    sensor_metrics: &HashMap<String, HashSet<String>>,
 ) -> Result<(), ConfigurationError> {
-    let Some(sensor_type) = sensor_types.get(&target.sensor_id) else {
+    let Some(metrics) = sensor_metrics.get(&target.sensor_id) else {
         return Err(ConfigurationError::Validation(format!(
             "anomaly profile '{profile_name}' references unknown sensor_id '{}'",
             target.sensor_id
         )));
     };
-    if !sensor_type.metric_names().contains(&target.metric.as_str()) {
+    if !metrics.contains(&target.metric) {
         return Err(ConfigurationError::Validation(format!(
             "anomaly profile '{profile_name}' metric '{}' is not emitted by sensor '{}'",
             target.metric, target.sensor_id
@@ -260,6 +304,9 @@ pub struct AnomalyTriggerConfig {
     pub threshold: f64,
     #[serde(default)]
     pub cooldown_samples: u64,
+    /// Deterministic baseline warm-up before this profile may activate.
+    #[serde(default)]
+    pub start_after_samples: u64,
 }
 
 impl Default for AnomalyTriggerConfig {
@@ -267,6 +314,7 @@ impl Default for AnomalyTriggerConfig {
         Self {
             threshold: default_anomaly_threshold(),
             cooldown_samples: 0,
+            start_after_samples: 0,
         }
     }
 }
@@ -288,6 +336,10 @@ pub enum AnomalyStrategyConfig {
         #[serde(default = "default_multiplier")]
         multiplier: f64,
     },
+    SpikeDrop {
+        spike_value: f64,
+        drop_value: f64,
+    },
     StuckAt {
         duration_samples: u64,
         /// Omit to freeze at the last valid value observed before activation.
@@ -296,6 +348,16 @@ pub enum AnomalyStrategyConfig {
     Drift {
         duration_samples: u64,
         total_offset: f64,
+    },
+    BatchCoolingStretch {
+        duration_samples: u64,
+        low: f64,
+        peak: f64,
+        rise_samples: u64,
+        plateau_samples: u64,
+        initial_cool_samples: u64,
+        final_cool_samples: u64,
+        batches: u64,
     },
     Noise {
         duration_samples: u64,
@@ -316,14 +378,17 @@ impl AnomalyStrategyConfig {
     fn validate(
         &self,
         profile_name: &str,
-        sensor_types: &HashMap<String, SensorType>,
+        sensor_metrics: &HashMap<String, HashSet<String>>,
     ) -> Result<(), ConfigurationError> {
         let invalid_duration = match self {
-            Self::Spike { .. } => false,
+            Self::Spike { .. } | Self::SpikeDrop { .. } => false,
             Self::StuckAt {
                 duration_samples, ..
             }
             | Self::Drift {
+                duration_samples, ..
+            }
+            | Self::BatchCoolingStretch {
                 duration_samples, ..
             }
             | Self::Noise {
@@ -344,6 +409,13 @@ impl AnomalyStrategyConfig {
                 validate_finite(profile_name, "offset", *offset)?;
                 validate_finite(profile_name, "multiplier", *multiplier)?;
             }
+            Self::SpikeDrop {
+                spike_value,
+                drop_value,
+            } => {
+                validate_finite(profile_name, "spike_value", *spike_value)?;
+                validate_finite(profile_name, "drop_value", *drop_value)?;
+            }
             Self::StuckAt { value, .. } => {
                 if let Some(value) = value {
                     validate_finite(profile_name, "value", *value)?;
@@ -351,6 +423,30 @@ impl AnomalyStrategyConfig {
             }
             Self::Drift { total_offset, .. } => {
                 validate_finite(profile_name, "total_offset", *total_offset)?;
+            }
+            Self::BatchCoolingStretch {
+                low,
+                peak,
+                rise_samples,
+                plateau_samples,
+                initial_cool_samples,
+                final_cool_samples,
+                batches,
+                ..
+            } => {
+                for (name, value) in [("low", *low), ("peak", *peak)] {
+                    validate_finite(profile_name, name, value)?;
+                }
+                if *rise_samples == 0
+                    || *plateau_samples == 0
+                    || *initial_cool_samples == 0
+                    || final_cool_samples < initial_cool_samples
+                    || *batches < 2
+                {
+                    return Err(ConfigurationError::Validation(format!(
+                        "anomaly profile '{profile_name}' has an invalid batch cooling profile"
+                    )));
+                }
             }
             Self::Noise { sigma, .. } => {
                 if !sigma.is_finite() || *sigma <= 0.0 {
@@ -366,7 +462,7 @@ impl AnomalyStrategyConfig {
                 multiplier,
                 ..
             } => {
-                validate_anomaly_target(profile_name, &condition.source, sensor_types)?;
+                validate_anomaly_target(profile_name, &condition.source, sensor_metrics)?;
                 validate_finite(profile_name, "condition.value", condition.value)?;
                 if let Some(value) = value {
                     validate_finite(profile_name, "value", *value)?;
@@ -416,8 +512,85 @@ pub struct ExportersConfig {
     pub prometheus: PrometheusConfig,
     #[serde(default)]
     pub kafka: KafkaConfig,
+    #[serde(default)]
+    pub dataset: DatasetConfig,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatasetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Inclusive RFC 3339 instant at which to begin generated history.
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default = "default_s3_endpoint_url")]
+    pub s3_endpoint_url: String,
+    #[serde(default = "default_s3_bucket_name")]
+    pub s3_bucket_name: String,
+    #[serde(default = "default_s3_access_key")]
+    pub s3_access_key: String,
+    #[serde(default = "default_s3_secret_key")]
+    pub s3_secret_key: String,
+}
+
+impl Default for DatasetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_time: None,
+            s3_endpoint_url: default_s3_endpoint_url(),
+            s3_bucket_name: default_s3_bucket_name(),
+            s3_access_key: default_s3_access_key(),
+            s3_secret_key: default_s3_secret_key(),
+        }
+    }
+}
+
+impl DatasetConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        let start_time = self.start_time.as_deref().ok_or_else(|| {
+            ConfigurationError::Validation(
+                "exporters.dataset.start_time is required when dataset exporter is enabled".into(),
+            )
+        })?;
+        let start = chrono::DateTime::parse_from_rfc3339(start_time).map_err(|error| {
+            ConfigurationError::Validation(format!(
+                "exporters.dataset.start_time must be RFC 3339: {error}"
+            ))
+        })?;
+        if start.timestamp_millis() > chrono::Utc::now().timestamp_millis() {
+            return Err(ConfigurationError::Validation(
+                "exporters.dataset.start_time must not be in the future".into(),
+            ));
+        }
+        for (name, value) in [
+            ("s3_endpoint_url", &self.s3_endpoint_url),
+            ("s3_bucket_name", &self.s3_bucket_name),
+            ("s3_access_key", &self.s3_access_key),
+            ("s3_secret_key", &self.s3_secret_key),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigurationError::Validation(format!(
+                    "exporters.dataset.{name} cannot be empty when dataset exporter is enabled"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_s3_endpoint_url() -> String {
+    "http://192.168.1.50:9000".into()
+}
+fn default_s3_bucket_name() -> String {
+    "iotsim".into()
+}
+fn default_s3_access_key() -> String {
+    "access".into()
+}
+fn default_s3_secret_key() -> String {
+    "secret".into()
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct PrometheusConfig {
     #[serde(default)]
@@ -509,6 +682,156 @@ pub struct SensorConfig {
     pub max_value: f64,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// A configurable single-metric physical signal used by the documented
+    /// industrial anomaly scenarios. Existing fixed sensor models do not use it.
+    pub scenario: Option<ScenarioSignalConfig>,
+    pub data_center_rack: Option<DataCenterRackConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DataCenterRackConfig {
+    pub ambient_temperature_f: f64,
+    pub max_thermal_lift_f: f64,
+    pub cooling_time_constant_minutes: f64,
+    pub managed_dew_point_f: f64,
+    #[serde(default)]
+    pub temperature_noise_sigma_f: f64,
+    #[serde(default)]
+    pub cpu_noise_sigma: f64,
+    #[serde(default)]
+    pub weekend_spike_probability: f64,
+    pub anomaly_temperature_f: f64,
+    pub anomaly_humidity_pct: f64,
+    /// Wall-clock duration in which the 672-sample logical week is emitted.
+    #[serde(default = "default_rack_week_duration_seconds")]
+    pub simulated_week_duration_seconds: f64,
+    pub seed: Option<u64>,
+}
+
+fn default_rack_week_duration_seconds() -> f64 {
+    7.0 * 24.0 * 60.0 * 60.0
+}
+
+impl DataCenterRackConfig {
+    fn validate(&self, sensor_id: &str) -> Result<(), ConfigurationError> {
+        let values = [
+            self.ambient_temperature_f,
+            self.max_thermal_lift_f,
+            self.cooling_time_constant_minutes,
+            self.managed_dew_point_f,
+            self.temperature_noise_sigma_f,
+            self.cpu_noise_sigma,
+            self.weekend_spike_probability,
+            self.anomaly_temperature_f,
+            self.anomaly_humidity_pct,
+            self.simulated_week_duration_seconds,
+        ];
+        if !values.into_iter().all(f64::is_finite)
+            || self.max_thermal_lift_f < 0.0
+            || self.cooling_time_constant_minutes <= 0.0
+            || self.temperature_noise_sigma_f < 0.0
+            || self.cpu_noise_sigma < 0.0
+            || !(0.0..=1.0).contains(&self.weekend_spike_probability)
+            || !(0.0..=100.0).contains(&self.anomaly_humidity_pct)
+            || self.simulated_week_duration_seconds <= 0.0
+        {
+            return Err(ConfigurationError::Validation(format!(
+                "data_center_rack sensor '{sensor_id}' has invalid physical model settings"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScenarioSignalConfig {
+    pub metric: String,
+    pub baseline: f64,
+    #[serde(default)]
+    pub noise_sigma: f64,
+    #[serde(default)]
+    pub waveform: ScenarioWaveformConfig,
+    pub seed: Option<u64>,
+}
+
+impl ScenarioSignalConfig {
+    fn validate(&self, sensor_id: &str) -> Result<(), ConfigurationError> {
+        if self.metric.trim().is_empty() || !self.baseline.is_finite() {
+            return Err(ConfigurationError::Validation(format!(
+                "scenario_signal sensor '{sensor_id}' requires a non-empty metric and finite baseline"
+            )));
+        }
+        if !self.noise_sigma.is_finite() || self.noise_sigma < 0.0 {
+            return Err(ConfigurationError::Validation(format!(
+                "scenario_signal sensor '{sensor_id}' noise_sigma must be finite and non-negative"
+            )));
+        }
+        self.waveform.validate(sensor_id)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScenarioWaveformConfig {
+    #[default]
+    Constant,
+    Sine {
+        amplitude: f64,
+        period_samples: u64,
+        #[serde(default)]
+        phase_radians: f64,
+    },
+    StepCycle {
+        values: Vec<f64>,
+        samples_per_step: u64,
+    },
+    BatchTemperature {
+        low: f64,
+        peak: f64,
+        rise_samples: u64,
+        plateau_samples: u64,
+        cool_samples: u64,
+    },
+}
+
+impl ScenarioWaveformConfig {
+    fn validate(&self, sensor_id: &str) -> Result<(), ConfigurationError> {
+        let invalid = match self {
+            Self::Constant => false,
+            Self::Sine {
+                amplitude,
+                period_samples,
+                phase_radians,
+            } => !amplitude.is_finite() || *period_samples == 0 || !phase_radians.is_finite(),
+            Self::StepCycle {
+                values,
+                samples_per_step,
+            } => {
+                values.is_empty()
+                    || *samples_per_step == 0
+                    || values.iter().any(|value| !value.is_finite())
+            }
+            Self::BatchTemperature {
+                low,
+                peak,
+                rise_samples,
+                plateau_samples,
+                cool_samples,
+            } => {
+                !low.is_finite()
+                    || !peak.is_finite()
+                    || *rise_samples == 0
+                    || *plateau_samples == 0
+                    || *cool_samples == 0
+            }
+        };
+        if invalid {
+            return Err(ConfigurationError::Validation(format!(
+                "scenario_signal sensor '{sensor_id}' has an invalid waveform"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl SensorConfig {
@@ -552,10 +875,12 @@ pub enum SensorType {
     Level,
     MassFlow,
     LoadCell,
+    ScenarioSignal,
+    DataCenterRack,
 }
 
 impl SensorType {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Weather,
         Self::Sound,
         Self::Electrical,
@@ -571,6 +896,8 @@ impl SensorType {
         Self::Level,
         Self::MassFlow,
         Self::LoadCell,
+        Self::ScenarioSignal,
+        Self::DataCenterRack,
     ];
 
     pub fn metric_names(self) -> &'static [&'static str] {
@@ -622,6 +949,14 @@ impl SensorType {
             Self::Level => &["tank_level_pct", "fluid_volume_liters"],
             Self::MassFlow => &["mass_flow_rate_l_min"],
             Self::LoadCell => &["load_cell_weight_kg", "mixer_active"],
+            // Metric names are declared per sensor in SensorConfig::scenario.
+            Self::ScenarioSignal => &[],
+            Self::DataCenterRack => &[
+                "cpu_utilization",
+                "temperature_f",
+                "relative_humidity_pct",
+                "day_of_week",
+            ],
         }
     }
 }
@@ -768,9 +1103,9 @@ mod tests {
             .iter()
             .map(|entity| entity.sensors.len())
             .sum();
-        assert_eq!(count, 15);
-        assert_eq!(config.entities.len(), 5);
-        assert_eq!(config.anomalies.profiles.len(), 5);
+        assert_eq!(count, 1);
+        assert_eq!(config.entities.len(), 1);
+        assert_eq!(config.anomalies.profiles.len(), 1);
     }
 
     #[test]
@@ -782,7 +1117,7 @@ mod tests {
         assert!(matches!(error, ConfigurationError::Validation(_)));
         assert!(error
             .to_string()
-            .contains("not emitted by sensor 'weather-01'"));
+            .contains("not emitted by sensor 'rack-telemetry-01'"));
     }
 
     #[test]
@@ -792,5 +1127,47 @@ mod tests {
 
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("must be between 0 and 1"));
+    }
+
+    #[test]
+    fn production_scenario_configuration_loads() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/simulation.yaml.prd");
+        AppConfig::load(path).unwrap();
+    }
+
+    #[test]
+    fn test_rack_configuration_emits_96_points_per_day_at_10_second_days() {
+        let config = AppConfig::load(super::sample_config_path()).unwrap();
+        let sensor = &config.entities[0].sensors[0];
+        let rack = sensor.data_center_rack.as_ref().unwrap();
+
+        assert_eq!(sensor.timestep_ms, 104);
+        assert_eq!(rack.simulated_week_duration_seconds, 70.0);
+    }
+
+    #[test]
+    fn dataset_exporter_is_exclusive_with_streaming_exporters() {
+        let mut config = AppConfig::load(super::sample_config_path()).unwrap();
+        config.exporters.dataset.enabled = true;
+        config.exporters.dataset.start_time = Some("2026-01-01T00:00:00Z".into());
+        config.exporters.kafka.enabled = true;
+
+        let error = config.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("dataset exporter cannot be enabled with Kafka or Prometheus exporters"));
+    }
+
+    #[test]
+    fn dataset_exporter_requires_a_historical_start_time() {
+        let mut config = AppConfig::load(super::sample_config_path()).unwrap();
+        config.exporters.prometheus.enabled = false;
+        config.exporters.kafka.enabled = false;
+        config.exporters.dataset.enabled = true;
+        config.exporters.dataset.start_time = None;
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("dataset.start_time is required"));
     }
 }

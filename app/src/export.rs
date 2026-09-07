@@ -1,3 +1,4 @@
+pub mod dataset;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod prometheus;
@@ -24,6 +25,8 @@ pub enum ExportError {
     Prometheus(String),
     #[error("Kafka exporter error: {0}")]
     Kafka(String),
+    #[error("dataset exporter error: {0}")]
+    Dataset(String),
     #[error("telemetry serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }

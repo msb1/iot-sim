@@ -51,6 +51,12 @@ impl SensorSchedule {
             sensor_id: self.definition.sensor.sensor_id.clone(),
             sensor_type: self.definition.sensor.sensor_type,
             timestamp_ms,
+            interval_ms: self
+                .definition
+                .sensor
+                .timestep
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
             sequence: self.sequence,
             metrics: metrics
                 .into_iter()
@@ -104,6 +110,8 @@ mod tests {
                 timestep: Duration::from_millis(250),
                 min_value: 0.0,
                 max_value: 14.0,
+                scenario: None,
+                data_center_rack: None,
             },
         };
         let mut schedule = SensorSchedule::new(sensor, start);
@@ -126,6 +134,8 @@ mod tests {
                 timestep: Duration::from_millis(100),
                 min_value: 30.0,
                 max_value: 120.0,
+                scenario: None,
+                data_center_rack: None,
             },
         };
         let mut schedule = SensorSchedule::new(sensor, start);

@@ -1,0 +1,256 @@
+config_name: "Industrial anomaly scenario simulation"
+schema_version: "1.0"
+
+runtime:
+  shutdown_timeout_seconds: 10
+
+logging:
+  simulator_stream:
+    enabled: false
+
+exporters:
+  prometheus:
+    enabled: true
+    bind: "0.0.0.0:9898"
+    path: "/metrics"
+  kafka:
+    enabled: true
+    brokers: "192.168.1.50:9092,192.168.1.50:9094,192.168.1.50:9096"
+    topic: "iot.telemetry.v1"
+    client_id: "iot-sim-industrial-scenarios"
+    security: { security_protocol: null, sasl_mechanism: null, username: null, password: null }
+
+anomalies:
+  enabled: true
+  seed: 42
+  profiles:
+    - name: "pumping_station_water_hammer"
+      enabled: true
+      type: "spike_drop"
+      target: { sensor_id: "water-line-pressure-01", metric: "line_pressure_psi" }
+      trigger: { threshold: 0.0, start_after_samples: 43210, cooldown_samples: 1000000 }
+      spike_value: 180.0
+      drop_value: 35.0
+    - name: "cleanroom_dew_point_frozen_sequence"
+      enabled: true
+      type: "stuck_at"
+      target: { sensor_id: "cleanroom-dew-point-01", metric: "moisture_ppm" }
+      trigger: { threshold: 0.0, start_after_samples: 4500, cooldown_samples: 1000000 }
+      duration_samples: 240
+      value: 10.0
+    - name: "fccu_feed_pressure_spike"
+      enabled: true
+      type: "spike"
+      target: { sensor_id: "fccu-feed-pressure-01", metric: "discharge_pressure_psi" }
+      trigger: { threshold: 0.0, start_after_samples: 86410, cooldown_samples: 1000000 }
+      offset: 430.0
+      multiplier: 1.0
+    - name: "fccu_hot_day_coolant_flow_drop"
+      enabled: true
+      type: "contextual"
+      target: { sensor_id: "fccu-coolant-flow-01", metric: "coolant_flow_lpm" }
+      trigger: { threshold: 0.0, start_after_samples: 480, cooldown_samples: 1000000 }
+      duration_samples: 120
+      condition:
+        source: { sensor_id: "fccu-ambient-temperature-01", metric: "ambient_temperature_c" }
+        operator: "greater_than_or_equal"
+        value: 39.0
+      value: 80.0
+    - name: "fccu_reactor_skin_micro_trend"
+      enabled: true
+      type: "drift"
+      target: { sensor_id: "fccu-surface-temperature-01", metric: "surface_temperature_c" }
+      trigger: { threshold: 0.0, start_after_samples: 336, cooldown_samples: 1000000 }
+      duration_samples: 336
+      total_offset: 1.4
+    - name: "stripper_differential_pressure_spike"
+      enabled: true
+      type: "spike"
+      target: { sensor_id: "stripper-dp-01", metric: "differential_pressure_psi" }
+      trigger: { threshold: 0.0, start_after_samples: 86410, cooldown_samples: 1000000 }
+      offset: 33.0
+      multiplier: 1.0
+    - name: "reactor_low_power_wrong_recipe"
+      enabled: true
+      type: "contextual"
+      target: { sensor_id: "reactor-agitator-power-01", metric: "motor_current_a" }
+      trigger: { threshold: 0.0, start_after_samples: 480, cooldown_samples: 1000000 }
+      duration_samples: 60
+      condition:
+        source: { sensor_id: "reactor-batch-step-01", metric: "batch_step" }
+        operator: "greater_than_or_equal"
+        value: 3.0
+      value: 5.0
+    - name: "reactor_jacket_fouling_trend"
+      enabled: true
+      type: "batch_cooling_stretch"
+      target: { sensor_id: "reactor-internal-temperature-01", metric: "reaction_temperature_c" }
+      trigger: { threshold: 0.0, start_after_samples: 525, cooldown_samples: 1000000 }
+      duration_samples: 1688
+      low: 30.0
+      peak: 85.0
+      rise_samples: 15
+      plateau_samples: 45
+      initial_cool_samples: 45
+      final_cool_samples: 60
+      batches: 15
+
+models:
+  weather:
+    initial_temperature_c: 22.0
+    initial_pressure_hpa: 1013.25
+    initial_humidity_pct: 50.0
+    temperature_measurement_noise_sigma: 0.1
+    temperature_drift_sigma: 0.05
+    pressure_measurement_noise_sigma: 0.05
+    pressure_drift_sigma: 0.2
+    humidity_noise_sigma: 0.5
+    storm_transition_rate: 0.25
+    storm_temperature_drop_c: 7.0
+    storm_pressure_drop_hpa: 30.0
+    storm_humidity_rise_pct: 35.0
+    diurnal_temperature_amplitude_c: 6.0
+    pressure_tide_amplitude_hpa: 1.5
+    storm_temperature_noise_multiplier: 2.0
+    storm_humidity_noise_multiplier: 1.5
+    storm_pressure_noise_multiplier: 4.0
+    storm_diurnal_amplitude_reduction_c: 1.0
+    temperature_cycle_phase_hour: 6.0
+    temperature_humidity_coupling: 4.0
+    storm_pressure_tide_reduction_hpa: 0.5
+    pressure_tides_per_day: 2.0
+  sound: { ambient_floor_db: 45.0, noise_sigma: 1.2, spike_probability_per_sample: 0.15, decay_rate: 3.0, spike_min_db: 65.0, spike_max_db: 85.0, spike_cutoff_db: 1.0 }
+  electrical:
+    nominal_voltage_v: 230.0
+    grid_impedance_ohm: 0.08
+    trip_threshold_amps: 65.0
+    phase_impedance_ohm: [5.0, 5.0, 4.8]
+    base_power_factor: [0.92, 0.91, 0.86]
+    background_voltage_thd_pct: 1.5
+    polluted_voltage_thd_pct: 8.2
+    fault_impedance_ohm: 2.1
+    voltage_noise_sigma: 0.3
+    current_noise_sigma: 0.1
+    power_factor_noise_sigma: 0.003
+    thd_noise_sigma: 0.12
+    current_thd_divisor_amps: 10.0
+    current_thd_multiplier: 0.4
+    thd_power_factor_penalty: 0.02
+  ph: { target_mean: 7.2, measurement_noise_sigma: 0.05, drift_sigma: 0.01 }
+  orp: { target_mean: 250.0, measurement_noise_sigma: 2.5, drift_sigma: 0.5 }
+  conductivity: { target_mean: 1.4, measurement_noise_sigma: 0.02, drift_sigma: 0.005 }
+  process:
+    initial_concentration_mol_l: 0.2
+    target_equilibrium_mol_l: 0.2
+    reversion_rate: 0.15
+    optical_path_length_cm: 1.0
+    molar_extinction: [0.05, 1.45, 2.10, 0.12]
+    optical_noise_sigma: 0.004
+    optical_drift_sigma: 0.0005
+    concentration_noise_sigma: 0.015
+  gas:
+    initial_temperature_c: 22.0
+    initial_humidity_pct: 50.0
+    baseline_co_ppm: 0.0
+    baseline_lel_pct: 0.0
+    baseline_voc_ppm: 0.1
+    hazard_co_ppm: 45.0
+    hazard_lel_pct: 12.4
+    hazard_voc_ppm: 85.0
+    safety_noise_sigma: 0.05
+    degradation_drift_sigma: 0.001
+    co_warning_ppm: 35.0
+    lel_warning_pct: 10.0
+    humidity_quenching_per_pct: 0.005
+    humidity_quenching_threshold_pct: 50.0
+    dissolved_oxygen_saturation_coefficients: [14.621, -0.449, 0.0057]
+    dissolved_oxygen_noise_multiplier: 0.4
+    co_noise_multiplier: 2.0
+    lel_noise_multiplier: 0.3
+    voc_noise_multiplier: 0.1
+    ventilation_poisoning_retention: 0.95
+  hydraulics:
+    max_capacity_liters: 1000.0
+    initial_fill_pct: 50.0
+    fluid_density_kg_l: 1.2
+    tank_tare_weight_kg: 450.0
+    base_inflow_l_min: 45.0
+    base_outflow_l_min: 45.0
+    high_discharge_l_min: 95.0
+    mixer_rpm: 120.0
+    mixer_harmonic_amplitude_kg: 8.5
+    level_noise_sigma: 0.15
+    flow_noise_sigma: 0.4
+    load_cell_noise_sigma: 0.25
+    mixer_start_after_seconds: null
+    high_discharge_after_seconds: null
+
+entities:
+  - entity_type: "water_treatment_and_pumping"
+    entity_id: "municipal_water_system_01"
+    description: "Water quality, filtration, tank level, energy, and pump-condition instrumentation"
+    sensors:
+      - { type: "ph", id_prefix: "water-ph-01", quantity: 1, timestep_ms: 5000, min_value: 0.0, max_value: 14.0 }
+      - { type: "conductivity", id_prefix: "water-conductivity-01", quantity: 1, timestep_ms: 5000, min_value: 0.0, max_value: 5.0 }
+      - { type: "scenario_signal", id_prefix: "water-turbidity-01", quantity: 1, timestep_ms: 5000, min_value: 0.0, max_value: 100.0, scenario: { metric: "turbidity_ntu", baseline: 0.3, noise_sigma: 0.03, seed: 1001 } }
+      - { type: "scenario_signal", id_prefix: "water-chlorine-01", quantity: 1, timestep_ms: 5000, min_value: 0.0, max_value: 10.0, scenario: { metric: "free_chlorine_mg_l", baseline: 1.5, noise_sigma: 0.05, seed: 1002 } }
+      - { type: "scenario_signal", id_prefix: "filter-dp-01", quantity: 1, timestep_ms: 1000, min_value: 0.0, max_value: 50.0, scenario: { metric: "filter_differential_pressure_psi", baseline: 8.0, noise_sigma: 0.15, seed: 1003 } }
+      - { type: "scenario_signal", id_prefix: "filter-flow-01", quantity: 1, timestep_ms: 1000, min_value: 0.0, max_value: 1000.0, scenario: { metric: "filter_flow_lpm", baseline: 420.0, noise_sigma: 4.0, seed: 1004 } }
+      - { type: "scenario_signal", id_prefix: "pump-vibration-01", quantity: 1, timestep_ms: 1000, min_value: 0.0, max_value: 100.0, scenario: { metric: "vibration_mm_s", baseline: 2.2, noise_sigma: 0.1, seed: 1005 } }
+      - { type: "scenario_signal", id_prefix: "pump-bearing-temperature-01", quantity: 1, timestep_ms: 1000, min_value: -40.0, max_value: 150.0, scenario: { metric: "bearing_temperature_c", baseline: 48.0, noise_sigma: 0.2, seed: 1006 } }
+      - { type: "scenario_signal", id_prefix: "pump-power-01", quantity: 1, timestep_ms: 1000, min_value: 0.0, max_value: 500.0, scenario: { metric: "active_power_kw", baseline: 75.0, noise_sigma: 0.5, seed: 1007 } }
+      - type: "scenario_signal"
+        id_prefix: "wet-well-level-01"
+        quantity: 1
+        timestep_ms: 1000
+        min_value: 0.0
+        max_value: 100.0
+        scenario: { metric: "wet_well_level_pct", baseline: 55.0, noise_sigma: 0.1, seed: 1008, waveform: { kind: "sine", amplitude: 30.0, period_samples: 600 } }
+      - type: "scenario_signal"
+        id_prefix: "water-line-pressure-01"
+        quantity: 1
+        timestep_ms: 500
+        min_value: 0.0
+        max_value: 250.0
+        scenario: { metric: "line_pressure_psi", baseline: 60.0, noise_sigma: 0.5, seed: 1009, waveform: { kind: "sine", amplitude: 1.5, period_samples: 120 } }
+
+  - entity_type: "data_center_rack"
+    entity_id: "data_center_rack_01"
+    description: "Seven-day correlated server-rack workload, exhaust, and humidity simulation"
+    sensors:
+      - type: "data_center_rack"
+        id_prefix: "rack-telemetry-01"
+        quantity: 1
+        timestep_ms: 60000
+        min_value: 0.0
+        max_value: 100.0
+        data_center_rack: { ambient_temperature_f: 68.0, max_thermal_lift_f: 24.0, cooling_time_constant_minutes: 20.0, managed_dew_point_f: 48.8, temperature_noise_sigma_f: 0.15, cpu_noise_sigma: 0.01, weekend_spike_probability: 0.01, anomaly_temperature_f: 85.0, anomaly_humidity_pct: 22.0, simulated_week_duration_seconds: 604800.0, seed: 2001 }
+
+  - entity_type: "battery_cleanroom"
+    entity_id: "battery_cleanroom_airlock_01"
+    description: "Dry-room moisture monitoring at a robotic air lock"
+    sensors:
+      - { type: "scenario_signal", id_prefix: "cleanroom-dew-point-01", quantity: 1, timestep_ms: 5000, min_value: 9.5, max_value: 10.5, scenario: { metric: "moisture_ppm", baseline: 10.0, noise_sigma: 0.18, seed: 3001 } }
+      - { type: "scenario_signal", id_prefix: "cleanroom-cart-passage-01", quantity: 1, timestep_ms: 5000, min_value: 0.0, max_value: 1.0, scenario: { metric: "cart_passage", baseline: 0.0, noise_sigma: 0.0, seed: 3002, waveform: { kind: "step_cycle", values: [0.0, 0.0, 0.0, 1.0], samples_per_step: 3 } } }
+
+  - entity_type: "fccu"
+    entity_id: "refinery_fccu_01"
+    description: "FCCU feed, cooling-water, ambient, vibration, and reactor-skin instrumentation"
+    sensors:
+      - { type: "scenario_signal", id_prefix: "fccu-feed-pressure-01", quantity: 1, timestep_ms: 250, min_value: 0.0, max_value: 800.0, scenario: { metric: "discharge_pressure_psi", baseline: 320.0, noise_sigma: 1.5, seed: 4001 } }
+      - { type: "scenario_signal", id_prefix: "fccu-coolant-flow-01", quantity: 1, timestep_ms: 60000, min_value: 0.0, max_value: 500.0, scenario: { metric: "coolant_flow_lpm", baseline: 350.0, noise_sigma: 3.0, seed: 4002, waveform: { kind: "step_cycle", values: [350.0, 80.0], samples_per_step: 1440 } } }
+      - { type: "scenario_signal", id_prefix: "fccu-ambient-temperature-01", quantity: 1, timestep_ms: 60000, min_value: -50.0, max_value: 60.0, scenario: { metric: "ambient_temperature_c", baseline: 39.0, noise_sigma: 0.2, seed: 4003, waveform: { kind: "step_cycle", values: [39.0, 5.0], samples_per_step: 1440 } } }
+      - { type: "scenario_signal", id_prefix: "fccu-surface-temperature-01", quantity: 1, timestep_ms: 3600000, min_value: 0.0, max_value: 260.0, scenario: { metric: "surface_temperature_c", baseline: 220.0, noise_sigma: 0.15, seed: 4004, waveform: { kind: "sine", amplitude: 10.0, period_samples: 24 } } }
+      - { type: "scenario_signal", id_prefix: "fccu-vibration-01", quantity: 1, timestep_ms: 1000, min_value: 0.0, max_value: 100.0, scenario: { metric: "reactor_vibration_mm_s", baseline: 3.0, noise_sigma: 0.15, seed: 4005 } }
+      - { type: "scenario_signal", id_prefix: "fccu-surface-temperature-02", quantity: 1, timestep_ms: 3600000, min_value: 0.0, max_value: 260.0, scenario: { metric: "surface_temperature_c", baseline: 220.0, noise_sigma: 0.15, seed: 4006, waveform: { kind: "sine", amplitude: 10.0, period_samples: 24 } } }
+
+  - entity_type: "batch_reactor_stripper_loop"
+    entity_id: "batch_reactor_stripper_01"
+    description: "Stripping-column, agitator, recipe, and reactor-jacket instrumentation"
+    sensors:
+      - { type: "scenario_signal", id_prefix: "stripper-dp-01", quantity: 1, timestep_ms: 250, min_value: 0.0, max_value: 60.0, scenario: { metric: "differential_pressure_psi", baseline: 12.0, noise_sigma: 0.12, seed: 5001 } }
+      - { type: "scenario_signal", id_prefix: "reactor-agitator-power-01", quantity: 1, timestep_ms: 60000, min_value: 0.0, max_value: 50.0, scenario: { metric: "motor_current_a", baseline: 5.0, noise_sigma: 0.15, seed: 5002, waveform: { kind: "step_cycle", values: [5.0, 15.0, 28.0, 28.0], samples_per_step: 15 } } }
+      - { type: "scenario_signal", id_prefix: "reactor-batch-step-01", quantity: 1, timestep_ms: 60000, min_value: 0.0, max_value: 10.0, scenario: { metric: "batch_step", baseline: 1.0, noise_sigma: 0.0, seed: 5003, waveform: { kind: "step_cycle", values: [1.0, 2.0, 3.0, 4.0], samples_per_step: 15 } } }
+      - { type: "scenario_signal", id_prefix: "reactor-internal-temperature-01", quantity: 1, timestep_ms: 60000, min_value: 0.0, max_value: 95.0, scenario: { metric: "reaction_temperature_c", baseline: 30.0, noise_sigma: 0.2, seed: 5004, waveform: { kind: "batch_temperature", low: 30.0, peak: 85.0, rise_samples: 15, plateau_samples: 45, cool_samples: 45 } } }
+      - { type: "scenario_signal", id_prefix: "reactor-jacket-inlet-01", quantity: 1, timestep_ms: 60000, min_value: 0.0, max_value: 95.0, scenario: { metric: "jacket_inlet_temperature_c", baseline: 20.0, noise_sigma: 0.15, seed: 5005 } }
+      - { type: "scenario_signal", id_prefix: "reactor-jacket-outlet-01", quantity: 1, timestep_ms: 60000, min_value: 0.0, max_value: 95.0, scenario: { metric: "jacket_outlet_temperature_c", baseline: 35.0, noise_sigma: 0.2, seed: 5006, waveform: { kind: "sine", amplitude: 8.0, period_samples: 105 } } }

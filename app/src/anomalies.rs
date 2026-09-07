@@ -63,6 +63,27 @@ pub struct SpikeAnomaly {
     multiplier: f64,
 }
 
+/// Two-sample impulse used for water-hammer signatures: an extreme positive
+/// pressure sample followed by the immediate pressure collapse.
+pub struct SpikeDropAnomaly {
+    spike_value: f64,
+    drop_value: f64,
+}
+
+impl AnomalyStrategy for SpikeDropAnomaly {
+    fn duration_samples(&self) -> u64 {
+        2
+    }
+
+    fn inject(&mut self, value: &mut f64, sample_index: u64, _rng: &mut StdRng) {
+        *value = if sample_index == 0 {
+            self.spike_value
+        } else {
+            self.drop_value
+        };
+    }
+}
+
 impl AnomalyStrategy for SpikeAnomaly {
     fn duration_samples(&self) -> u64 {
         1
@@ -96,6 +117,54 @@ impl AnomalyStrategy for StuckAtAnomaly {
 pub struct CalibrationDriftAnomaly {
     duration_samples: u64,
     total_offset: f64,
+}
+
+pub struct BatchCoolingStretchAnomaly {
+    duration_samples: u64,
+    low: f64,
+    peak: f64,
+    rise_samples: u64,
+    plateau_samples: u64,
+    initial_cool_samples: u64,
+    final_cool_samples: u64,
+    batches: u64,
+}
+
+impl AnomalyStrategy for BatchCoolingStretchAnomaly {
+    fn duration_samples(&self) -> u64 {
+        self.duration_samples
+    }
+
+    fn inject(&mut self, value: &mut f64, sample_index: u64, _rng: &mut StdRng) {
+        let mut position = sample_index;
+        let mut batch = 0;
+        while batch + 1 < self.batches {
+            let cycle = self.rise_samples + self.plateau_samples + self.cool_samples(batch);
+            if position < cycle {
+                break;
+            }
+            position -= cycle;
+            batch += 1;
+        }
+        let cool_samples = self.cool_samples(batch);
+        *value = if position < self.rise_samples {
+            self.low + (self.peak - self.low) * position as f64 / self.rise_samples as f64
+        } else if position < self.rise_samples + self.plateau_samples {
+            self.peak
+        } else {
+            let cooling_position = position - self.rise_samples - self.plateau_samples;
+            self.peak
+                - (self.peak - self.low)
+                    * (cooling_position.min(cool_samples) as f64 / cool_samples as f64)
+        };
+    }
+}
+
+impl BatchCoolingStretchAnomaly {
+    fn cool_samples(&self, batch: u64) -> u64 {
+        let span = self.final_cool_samples - self.initial_cool_samples;
+        self.initial_cool_samples + (span * batch + (self.batches - 1) / 2) / (self.batches - 1)
+    }
 }
 
 impl AnomalyStrategy for CalibrationDriftAnomaly {
@@ -172,6 +241,7 @@ struct AnomalyProfile {
     remaining_samples: u64,
     active_sample_index: u64,
     cooldown_remaining: u64,
+    observed_samples: u64,
 }
 
 impl AnomalyProfile {
@@ -180,6 +250,13 @@ impl AnomalyProfile {
             AnomalyStrategyConfig::Spike { offset, multiplier } => Box::new(SpikeAnomaly {
                 offset: *offset,
                 multiplier: *multiplier,
+            }),
+            AnomalyStrategyConfig::SpikeDrop {
+                spike_value,
+                drop_value,
+            } => Box::new(SpikeDropAnomaly {
+                spike_value: *spike_value,
+                drop_value: *drop_value,
             }),
             AnomalyStrategyConfig::StuckAt {
                 duration_samples,
@@ -195,6 +272,25 @@ impl AnomalyProfile {
             } => Box::new(CalibrationDriftAnomaly {
                 duration_samples: *duration_samples,
                 total_offset: *total_offset,
+            }),
+            AnomalyStrategyConfig::BatchCoolingStretch {
+                duration_samples,
+                low,
+                peak,
+                rise_samples,
+                plateau_samples,
+                initial_cool_samples,
+                final_cool_samples,
+                batches,
+            } => Box::new(BatchCoolingStretchAnomaly {
+                duration_samples: *duration_samples,
+                low: *low,
+                peak: *peak,
+                rise_samples: *rise_samples,
+                plateau_samples: *plateau_samples,
+                initial_cool_samples: *initial_cool_samples,
+                final_cool_samples: *final_cool_samples,
+                batches: *batches,
             }),
             AnomalyStrategyConfig::Noise {
                 duration_samples,
@@ -226,6 +322,7 @@ impl AnomalyProfile {
             remaining_samples: 0,
             active_sample_index: 0,
             cooldown_remaining: 0,
+            observed_samples: 0,
         }
     }
 
@@ -236,6 +333,10 @@ impl AnomalyProfile {
         context: &InjectionContext<'_>,
         rng: &mut StdRng,
     ) {
+        if self.observed_samples < self.trigger.start_after_samples {
+            self.observed_samples += 1;
+            return;
+        }
         if self.remaining_samples == 0 {
             if self.cooldown_remaining > 0 {
                 self.cooldown_remaining -= 1;
@@ -361,6 +462,7 @@ mod tests {
             sensor_id: sensor_id.into(),
             sensor_type,
             timestamp_ms: 1,
+            interval_ms: 1_000,
             sequence: 1,
             metrics: BTreeMap::from([(metric.into(), value)]),
         }
@@ -380,6 +482,7 @@ mod tests {
                 trigger: AnomalyTriggerConfig {
                     threshold: 0.0,
                     cooldown_samples: 1,
+                    start_after_samples: 0,
                 },
                 strategy,
             }],
@@ -400,6 +503,40 @@ mod tests {
         }));
         assert_eq!(inject_value(&mut injector, 10.0), 40.0);
         assert_eq!(inject_value(&mut injector, 10.0), 10.0);
+    }
+
+    #[test]
+    fn spike_drop_emits_impulse_then_collapse() {
+        let mut injector =
+            AnomalyInjector::from_config(&config(AnomalyStrategyConfig::SpikeDrop {
+                spike_value: 180.0,
+                drop_value: 35.0,
+            }));
+        assert_eq!(inject_value(&mut injector, 60.0), 180.0);
+        assert_eq!(inject_value(&mut injector, 60.0), 35.0);
+        assert_eq!(inject_value(&mut injector, 60.0), 60.0);
+    }
+
+    #[test]
+    fn batch_cooling_profile_reaches_sixty_samples_by_batch_fifteen() {
+        let strategy = BatchCoolingStretchAnomaly {
+            duration_samples: 1688,
+            low: 30.0,
+            peak: 85.0,
+            rise_samples: 15,
+            plateau_samples: 45,
+            initial_cool_samples: 45,
+            final_cool_samples: 60,
+            batches: 15,
+        };
+        assert_eq!(strategy.cool_samples(0), 45);
+        assert_eq!(strategy.cool_samples(14), 60);
+        assert_eq!(
+            (0..15)
+                .map(|batch| 60 + strategy.cool_samples(batch))
+                .sum::<u64>(),
+            1688
+        );
     }
 
     #[test]
