@@ -22,6 +22,7 @@ struct RackSchedule {
     sample_index: u64,
     temperature_f: f64,
     week_started_at: Instant,
+    logical_week: u64,
     next_due: Instant,
     rng: StdRng,
     real_calendar: bool,
@@ -60,6 +61,7 @@ impl DataCenterRackService {
                     sample_index: 0,
                     temperature_f,
                     week_started_at: start,
+                    logical_week: 0,
                     next_due: start,
                     rng,
                     real_calendar,
@@ -116,6 +118,7 @@ fn advance_schedule(rack: &mut RackSchedule) {
     let week_duration = Duration::from_secs_f64(rack.config.simulated_week_duration_seconds);
     if rack.sample_index == SAMPLES_PER_WEEK {
         rack.sample_index = 0;
+        rack.logical_week += 1;
         rack.week_started_at += week_duration;
     }
     let elapsed = week_duration.mul_f64(rack.sample_index as f64 / SAMPLES_PER_WEEK as f64);
@@ -138,7 +141,14 @@ fn rack_values(rack: &mut RackSchedule, timestamp_ms: i64) -> [(String, f64); 4]
         )
     };
     let is_weekend = day_of_week >= 6;
-    let anomaly = day_of_week == 7 && minute_of_day >= 8 * 60;
+    let scheduled_week = rack.logical_week >= rack.config.collective_anomaly_start_week
+        && (rack.logical_week - rack.config.collective_anomaly_start_week)
+            .is_multiple_of(rack.config.collective_anomaly_interval_weeks);
+    let anomaly = scheduled_week
+        && day_of_week == 7
+        && minute_of_day >= 8 * 60
+        && minute_of_day
+            < 8 * 60 + rack.config.collective_anomaly_duration_samples * MINUTES_PER_SAMPLE;
 
     let cpu_utilization = if anomaly {
         0.10
@@ -226,6 +236,9 @@ mod tests {
             weekend_spike_probability: 0.0,
             anomaly_temperature_f: 85.0,
             anomaly_humidity_pct: 22.0,
+            collective_anomaly_start_week: 0,
+            collective_anomaly_interval_weeks: 1,
+            collective_anomaly_duration_samples: 64,
             simulated_week_duration_seconds: 70.0,
             seed: Some(1),
         }
@@ -245,6 +258,7 @@ mod tests {
                 max_value: 100.0,
                 scenario: None,
                 data_center_rack: Some(config()),
+                robotic_air_lock: None,
             },
         };
         let mut rack = RackSchedule {
@@ -253,6 +267,7 @@ mod tests {
             sample_index: 6 * SAMPLES_PER_DAY + 8 * 60 / MINUTES_PER_SAMPLE,
             temperature_f: 68.0,
             week_started_at: start,
+            logical_week: 0,
             next_due: start,
             rng: StdRng::seed_from_u64(1),
             real_calendar: false,
@@ -262,6 +277,36 @@ mod tests {
         assert_eq!(values[1].1, 85.0);
         assert_eq!(values[2].1, 22.0);
         assert_eq!(values[3].1, 7.0);
+    }
+
+    #[test]
+    fn collective_anomaly_respects_start_and_interval_weeks() {
+        let start = Instant::now();
+        let mut rack = RackSchedule {
+            schedule: SensorSchedule::new(test_sensor(), start),
+            config: DataCenterRackConfig {
+                collective_anomaly_start_week: 4,
+                collective_anomaly_interval_weeks: 20,
+                ..config()
+            },
+            sample_index: 6 * SAMPLES_PER_DAY + 8 * 60 / MINUTES_PER_SAMPLE,
+            temperature_f: 68.0,
+            week_started_at: start,
+            logical_week: 3,
+            next_due: start,
+            rng: StdRng::seed_from_u64(1),
+            real_calendar: false,
+        };
+        assert_ne!(rack_values(&mut rack, 0)[1].1, 85.0);
+
+        rack.logical_week = 4;
+        assert_eq!(rack_values(&mut rack, 0)[1].1, 85.0);
+
+        rack.logical_week = 5;
+        assert_ne!(rack_values(&mut rack, 0)[1].1, 85.0);
+
+        rack.logical_week = 24;
+        assert_eq!(rack_values(&mut rack, 0)[1].1, 85.0);
     }
 
     #[test]
@@ -283,6 +328,7 @@ mod tests {
                 max_value: 100.0,
                 scenario: None,
                 data_center_rack: Some(config()),
+                robotic_air_lock: None,
             },
         };
         let mut rack = RackSchedule {
@@ -291,6 +337,7 @@ mod tests {
             sample_index: 0,
             temperature_f: 68.0,
             week_started_at: start,
+            logical_week: 0,
             next_due: start,
             rng: StdRng::seed_from_u64(1),
             real_calendar: false,
@@ -311,6 +358,7 @@ mod tests {
             sample_index: SAMPLES_PER_DAY - 1,
             temperature_f: 68.0,
             week_started_at: start,
+            logical_week: 0,
             next_due: start,
             rng: StdRng::seed_from_u64(1),
             real_calendar: false,
@@ -333,6 +381,7 @@ mod tests {
                 max_value: 100.0,
                 scenario: None,
                 data_center_rack: Some(config()),
+                robotic_air_lock: None,
             },
         }
     }

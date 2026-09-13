@@ -1,6 +1,6 @@
 # Simulators and sensors
 
-The configuration defines 17 logical sensor types. Some are individual models and some are output channels of a shared, coupled physical model. A logical sensor can be replicated with `quantity`; the sample facility currently configures one instance of each type.
+The configuration defines 18 logical sensor types. Some are individual models and some are output channels of a shared, coupled physical model. A logical sensor can be replicated with `quantity`.
 
 ## Inventory
 
@@ -22,6 +22,7 @@ The configuration defines 17 logical sensor types. Some are individual models an
 | Hydraulics service / tank model | `mixing_tank_01` | Mass flow | `flow-01` | 1,000 ms | `mass_flow_rate_l_min` |
 | Hydraulics service / tank model | `mixing_tank_01` | Load cell | `load-01` | 2,500 ms | `load_cell_weight_kg`, `mixer_active` |
 | Data-center rack service / correlated physical model | `data_center_rack_01` | Data-center rack | `rack-telemetry-01` | ~104 ms wall-clock in test mode (96 points per 10-second simulated day) | `cpu_utilization`, `temperature_f`, `relative_humidity_pct`, `day_of_week` |
+| Robotic-air-lock service / correlated physical model | `battery_cleanroom_airlock_01` | Robotic air lock | `mal-robotic-04-telemetry` | 1,000 ms | dew point, ambient temperature/RH, differential pressure, purge flow, doors, seal pressure, cart movement, cycle status, and equipment state |
 
 ## Simulator behavior
 
@@ -53,6 +54,12 @@ The gas-safety model couples four outputs through shared ambient conditions and 
 
 The hydraulics model maintains a shared tank volume. Inflow and outflow drive the volume and level; outflow is measured as mass flow; volume and density determine load-cell weight. Configured scenario timings can start a mixer and increase discharge flow. When the mixer is active, the load cell includes a harmonic vibration component. Parameters are under `models.hydraulics`.
 
+### Robotic battery dry-room air lock
+
+The `robotic_air_lock` model emits an atomic, correlated sensor frame: atmospheric dew point, dry-bulb temperature and RH; differential pressure and purge flow; outer/inner door states, inflatable-seal pressure, and cart presence/speed. Its supplied production cycle is 300 seconds (45-second ingress, 15-second sealing, 105-second purge, 45-second egress, 90-second reset), giving 12 cycles/hour and 288 cycles/day.
+
+`cycle_status_code` maps to ingress=0, sealing=1, purging=2, egress=3, reset=4, maintenance=5. `equipment_state_code` maps to nominal=0, faulted seal=1, maintenance offline=2. The model configuration contains normal physics only. The global `anomalies.profiles` section owns `robotic_air_lock_seal_failure` and `robotic_air_lock_wet_payload`; those profiles are resolved before sampling, so a seal failure can coherently affect seal pressure, differential pressure, dew point, and door interlocking. Their timings are measured in complete production cycles.
+
 ## Adding or scaling sensors
 
 Add a sensor entry under an entity in `config/simulation.yaml`, choose one of the existing `type` values, and set `id_prefix`, `quantity`, `timestep_ms`, `min_value`, and `max_value`. Sensors of an existing type use that type's configured model parameters. A completely new sensor type requires four additions: a `SensorType` value, configuration schema, a simulator service or existing-service mapping, and exporter-compatible metrics.
@@ -61,7 +68,7 @@ For reliable analytics, keep `sensor_id` stable across runs and change only scen
 
 ## Anomaly injection
 
-The shared anomaly engine runs on `SensorReading` batches after every physical model has produced and clamped its baseline values. Because every service emits the same payload type, any metric from any of the 15 logical sensor types can be targeted without modifying that simulator. Exporters receive the altered readings through the normal telemetry contract.
+The shared anomaly engine applies metric-level profiles to `SensorReading` batches after physical models produce and clamp baseline values. Model-level profiles are resolved before their correlated model samples. This split preserves the common global configuration and lifecycle while preventing multi-channel physical faults from becoming incoherent post-sample metric edits. Exporters receive the altered readings through the normal telemetry contract.
 
 | Type | Scope | Configuration and behavior |
 | --- | --- | --- |
@@ -70,6 +77,8 @@ The shared anomaly engine runs on `SensorReading` batches after every physical m
 | `drift` | Collective/trend | Adds a linear ramp from zero through `total_offset` across the active window. |
 | `noise` | Collective | Adds independent zero-mean Gaussian noise with standard deviation `sigma` for the active window. |
 | `contextual` | Contextual | Starts only while a condition on another sensor metric is true, then applies `value` (if supplied), `multiplier`, and `offset` for the active window. |
+| `robotic_air_lock_seal_failure` | Model-level | Evaluates the shared seeded `trigger.threshold` once per eligible production cycle after `start_after_cycles`; faults the seal for configured full cycles, then takes the air lock offline for maintenance. |
+| `robotic_air_lock_wet_payload` | Model-level | Evaluates the shared seeded `trigger.threshold` once per eligible production cycle after `start_after_cycles` and slows physical purge recovery for configured cycles. |
 
 Each profile has its own random activation check. A uniform draw greater than or equal to `trigger.threshold` starts an eligible event; high thresholds make events rare. `cooldown_samples` prevents immediate reactivation, and both cooldowns and active durations advance only when the target metric is emitted. Set `anomalies.seed` to reproduce activation and noise sequences.
 

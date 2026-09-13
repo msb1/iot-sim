@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use serde::Serialize;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -233,6 +235,248 @@ fn compare(actual: f64, operator: ComparisonOperator, expected: f64) -> bool {
     }
 }
 
+/// Read-only model-level anomaly state for one robotic-air-lock production
+/// cycle. It is resolved before the physical model generates a frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RoboticAirLockAnomalyState {
+    pub seal_faulted: bool,
+    pub maintenance_offline: bool,
+    pub wet_payload_recovery_multiplier: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnomalyEvent {
+    pub timestamp_ms: i64,
+    pub anomaly_type: String,
+    pub profile: String,
+    pub sensor_id: String,
+    pub cycle: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct AnomalyEventCollector {
+    events: Mutex<Vec<AnomalyEvent>>,
+}
+
+impl AnomalyEventCollector {
+    pub fn record(&self, event: AnomalyEvent) {
+        self.events.lock().expect("anomaly event collector poisoned").push(event);
+    }
+
+    pub fn snapshot(&self) -> Vec<AnomalyEvent> {
+        self.events.lock().expect("anomaly event collector poisoned").clone()
+    }
+}
+
+enum RoboticAirLockProfile {
+    SealFailure {
+        name: String,
+        sensor_id: String,
+        trigger: AirLockCycleTrigger,
+        faulted_cycles_before_maintenance: u64,
+        maintenance_cycles: u64,
+        active_start_cycle: Option<u64>,
+    },
+    WetPayload {
+        name: String,
+        sensor_id: String,
+        trigger: AirLockCycleTrigger,
+        duration_cycles: u64,
+        recovery_multiplier: f64,
+        active_start_cycle: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct AirLockCycleTrigger {
+    threshold: f64,
+    start_after_cycles: u64,
+    last_evaluated_cycle: u64,
+}
+
+/// Global model-level anomaly registry. Unlike `AnomalyInjector`, this does
+/// not alter exported readings after sampling: correlated simulators query it
+/// before computing their coupled physical state.
+pub struct ModelAnomalyController {
+    state: Mutex<ModelAnomalyState>,
+    events: Arc<AnomalyEventCollector>,
+}
+
+struct ModelAnomalyState {
+    robotic_air_lock_profiles: Vec<RoboticAirLockProfile>,
+    rng: StdRng,
+}
+
+impl ModelAnomalyController {
+    pub fn from_config(config: &AnomaliesConfig) -> Self {
+        Self::from_config_with_events(config, Arc::new(AnomalyEventCollector::default()))
+    }
+
+    pub fn from_config_with_events(config: &AnomaliesConfig, events: Arc<AnomalyEventCollector>) -> Self {
+        let robotic_air_lock_profiles = if config.enabled {
+            config
+                .profiles
+                .iter()
+                .filter(|profile| profile.enabled)
+                .filter_map(|profile| match &profile.strategy {
+                    AnomalyStrategyConfig::RoboticAirLockSealFailure {
+                        faulted_cycles_before_maintenance,
+                        maintenance_cycles,
+                    } => Some(RoboticAirLockProfile::SealFailure {
+                        name: profile.name.clone(),
+                        sensor_id: profile.target.sensor_id.clone(),
+                        trigger: AirLockCycleTrigger {
+                            threshold: profile.trigger.threshold,
+                            start_after_cycles: profile.trigger.start_after_cycles,
+                            last_evaluated_cycle: 0,
+                        },
+                        faulted_cycles_before_maintenance: *faulted_cycles_before_maintenance,
+                        maintenance_cycles: *maintenance_cycles,
+                        active_start_cycle: None,
+                    }),
+                    AnomalyStrategyConfig::RoboticAirLockWetPayload {
+                        duration_cycles,
+                        recovery_multiplier,
+                    } => Some(RoboticAirLockProfile::WetPayload {
+                        name: profile.name.clone(),
+                        sensor_id: profile.target.sensor_id.clone(),
+                        trigger: AirLockCycleTrigger {
+                            threshold: profile.trigger.threshold,
+                            start_after_cycles: profile.trigger.start_after_cycles,
+                            last_evaluated_cycle: 0,
+                        },
+                        duration_cycles: *duration_cycles,
+                        recovery_multiplier: *recovery_multiplier,
+                        active_start_cycle: None,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            state: Mutex::new(ModelAnomalyState {
+                robotic_air_lock_profiles,
+                rng: config
+                    .seed
+                    .map(StdRng::seed_from_u64)
+                    .unwrap_or_else(StdRng::from_entropy),
+            }),
+            events,
+        }
+    }
+
+    pub fn active_profile_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("model anomaly controller mutex was poisoned")
+            .robotic_air_lock_profiles
+            .len()
+    }
+
+    pub fn robotic_air_lock_state(
+        &self,
+        sensor_id: &str,
+        cycle: u64,
+        timestamp_ms: i64,
+    ) -> RoboticAirLockAnomalyState {
+        let mut state = RoboticAirLockAnomalyState::default();
+        let mut controller = self
+            .state
+            .lock()
+            .expect("model anomaly controller mutex was poisoned");
+        let ModelAnomalyState {
+            robotic_air_lock_profiles,
+            rng,
+        } = &mut *controller;
+        for profile in robotic_air_lock_profiles {
+            match profile {
+                RoboticAirLockProfile::SealFailure {
+                    name,
+                    sensor_id: target_sensor,
+                    trigger,
+                    faulted_cycles_before_maintenance,
+                    maintenance_cycles,
+                    active_start_cycle,
+                } if target_sensor == sensor_id => {
+                    if activate_for_cycle(trigger, active_start_cycle, cycle, rng) {
+                        self.events.record(AnomalyEvent { timestamp_ms, anomaly_type: "robotic_air_lock_seal_failure".into(), profile: name.clone(), sensor_id: target_sensor.clone(), cycle: Some(cycle) });
+                    }
+                    let Some(start_cycle) = *active_start_cycle else {
+                        continue;
+                    };
+                    let fault_end = start_cycle.saturating_add(*faulted_cycles_before_maintenance);
+                    let maintenance_end = fault_end.saturating_add(*maintenance_cycles);
+                    if (start_cycle..fault_end).contains(&cycle) {
+                        tracing::debug!(anomaly = %name, sensor_id, cycle, "robotic air-lock seal fault active");
+                        state.seal_faulted = true;
+                    } else if (fault_end..maintenance_end).contains(&cycle) {
+                        tracing::debug!(anomaly = %name, sensor_id, cycle, "robotic air-lock maintenance active");
+                        state.maintenance_offline = true;
+                    } else if cycle >= maintenance_end {
+                        *active_start_cycle = None;
+                        trigger.last_evaluated_cycle = cycle;
+                    }
+                }
+                RoboticAirLockProfile::WetPayload {
+                    name,
+                    sensor_id: target_sensor,
+                    trigger,
+                    duration_cycles,
+                    recovery_multiplier,
+                    active_start_cycle,
+                } if target_sensor == sensor_id => {
+                    if activate_for_cycle(trigger, active_start_cycle, cycle, rng) {
+                        self.events.record(AnomalyEvent { timestamp_ms, anomaly_type: "robotic_air_lock_wet_payload".into(), profile: name.clone(), sensor_id: target_sensor.clone(), cycle: Some(cycle) });
+                    }
+                    if let Some(start_cycle) = *active_start_cycle {
+                        let end_cycle = start_cycle.saturating_add(*duration_cycles);
+                        if (start_cycle..end_cycle).contains(&cycle) {
+                            tracing::debug!(anomaly = %name, sensor_id, cycle, "robotic air-lock wet payload active");
+                            state.wet_payload_recovery_multiplier = Some(*recovery_multiplier);
+                        } else if cycle >= end_cycle {
+                            *active_start_cycle = None;
+                            trigger.last_evaluated_cycle = cycle;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        state
+    }
+}
+
+fn activate_for_cycle(
+    trigger: &mut AirLockCycleTrigger,
+    active_start_cycle: &mut Option<u64>,
+    cycle: u64,
+    rng: &mut StdRng,
+) -> bool {
+    if active_start_cycle.is_some()
+        || cycle <= trigger.start_after_cycles
+        || trigger.last_evaluated_cycle == cycle
+    {
+        return false;
+    }
+    trigger.last_evaluated_cycle = cycle;
+    if rng.gen::<f64>() >= trigger.threshold {
+        *active_start_cycle = Some(cycle);
+        true
+    } else {
+        false
+    }
+}
+
+fn is_model_level_strategy(strategy: &AnomalyStrategyConfig) -> bool {
+    matches!(
+        strategy,
+        AnomalyStrategyConfig::RoboticAirLockSealFailure { .. }
+            | AnomalyStrategyConfig::RoboticAirLockWetPayload { .. }
+    )
+}
+
 struct AnomalyProfile {
     name: String,
     target: AnomalyTargetConfig,
@@ -313,6 +557,10 @@ impl AnomalyProfile {
                 offset: *offset,
                 multiplier: *multiplier,
             }),
+            AnomalyStrategyConfig::RoboticAirLockSealFailure { .. }
+            | AnomalyStrategyConfig::RoboticAirLockWetPayload { .. } => {
+                unreachable!("model-level anomaly profiles are not post-sample injectors")
+            }
         };
         Self {
             name: config.name.clone(),
@@ -385,6 +633,7 @@ impl AnomalyInjector {
                 .profiles
                 .iter()
                 .filter(|profile| profile.enabled)
+                .filter(|profile| !is_model_level_strategy(&profile.strategy))
                 .map(AnomalyProfile::from_config)
                 .collect()
         } else {
@@ -446,9 +695,75 @@ impl AnomalyInjector {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::config::{AnomalyTargetConfig, SensorType};
+    use crate::config::{
+        AnomaliesConfig, AnomalyProfileConfig, AnomalyStrategyConfig, AnomalyTargetConfig,
+        AnomalyTriggerConfig, SensorType,
+    };
 
     use super::*;
+
+    #[test]
+    fn model_level_air_lock_profiles_control_complete_cycle_states() {
+        let config = AnomaliesConfig {
+            enabled: true,
+            seed: Some(42),
+            profiles: vec![
+                AnomalyProfileConfig {
+                    name: "seal_failure".into(),
+                    enabled: true,
+                    target: AnomalyTargetConfig {
+                        sensor_id: "mal-01".into(),
+                        metric: "equipment_state_code".into(),
+                    },
+                    trigger: AnomalyTriggerConfig {
+                        threshold: 0.0,
+                        start_after_cycles: 1,
+                        ..Default::default()
+                    },
+                    strategy: AnomalyStrategyConfig::RoboticAirLockSealFailure {
+                        faulted_cycles_before_maintenance: 3,
+                        maintenance_cycles: 1,
+                    },
+                },
+                AnomalyProfileConfig {
+                    name: "wet_payload".into(),
+                    enabled: true,
+                    target: AnomalyTargetConfig {
+                        sensor_id: "mal-01".into(),
+                        metric: "dew_point_c".into(),
+                    },
+                    trigger: AnomalyTriggerConfig {
+                        threshold: 0.0,
+                        start_after_cycles: 6,
+                        ..Default::default()
+                    },
+                    strategy: AnomalyStrategyConfig::RoboticAirLockWetPayload {
+                        duration_cycles: 1,
+                        recovery_multiplier: 3.0,
+                    },
+                },
+            ],
+        };
+        let controller = ModelAnomalyController::from_config(&config);
+
+        assert_eq!(
+            controller.robotic_air_lock_state("mal-01", 1, 0),
+            RoboticAirLockAnomalyState::default()
+        );
+        assert!(controller.robotic_air_lock_state("mal-01", 2, 0).seal_faulted);
+        assert!(controller.robotic_air_lock_state("mal-01", 4, 0).seal_faulted);
+        assert!(
+            controller
+                .robotic_air_lock_state("mal-01", 5, 0)
+                .maintenance_offline
+        );
+        assert_eq!(
+            controller
+                .robotic_air_lock_state("mal-01", 7, 0)
+                .wet_payload_recovery_multiplier,
+            Some(3.0)
+        );
+    }
 
     fn reading(
         sensor_id: &str,
@@ -483,6 +798,7 @@ mod tests {
                     threshold: 0.0,
                     cooldown_samples: 1,
                     start_after_samples: 0,
+                    start_after_cycles: 0,
                 },
                 strategy,
             }],

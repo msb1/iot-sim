@@ -1,4 +1,5 @@
 pub mod dataset;
+pub mod metadata;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod prometheus;
@@ -27,6 +28,8 @@ pub enum ExportError {
     Kafka(String),
     #[error("dataset exporter error: {0}")]
     Dataset(String),
+    #[error("metadata exporter error: {0}")]
+    Metadata(String),
     #[error("telemetry serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }

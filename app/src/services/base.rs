@@ -112,6 +112,7 @@ mod tests {
                 max_value: 14.0,
                 scenario: None,
                 data_center_rack: None,
+                robotic_air_lock: None,
             },
         };
         let mut schedule = SensorSchedule::new(sensor, start);
@@ -136,6 +137,7 @@ mod tests {
                 max_value: 120.0,
                 scenario: None,
                 data_center_rack: None,
+                robotic_air_lock: None,
             },
         };
         let mut schedule = SensorSchedule::new(sensor, start);

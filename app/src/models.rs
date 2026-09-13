@@ -1,3 +1,4 @@
+pub mod airlock;
 pub mod base_models;
 pub mod electrical;
 pub mod gas;
@@ -7,6 +8,7 @@ pub mod sensor_profile;
 pub mod sound;
 pub mod weather;
 
+pub use airlock::RoboticAirLockTelemetry;
 pub use electrical::{PhaseReading, ThreePhaseSensorSimulator};
 pub use gas::{GasEnvironmentalSafetySimulator, GasSafetyTelemetry};
 pub use liquid::{FluidHydraulicsSimulator, HydraulicsTelemetry};

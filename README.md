@@ -1,6 +1,6 @@
 # iot-sim
 
-`iot-sim` is an asynchronous Rust simulator for analytics development and integration testing. It retains its original 15 fixed sensor types and adds configurable industrial scenario signals, schedules every enabled sensor at its own interval, can inject point/contextual/collective anomalies, and exports timestamped telemetry to Prometheus, Kafka, or a historical Parquet dataset in S3-compatible storage.
+`iot-sim` is an asynchronous Rust simulator for analytics development and integration testing. It retains its original fixed sensor types, configurable industrial scenario signals, and a correlated robotic battery dry-room air-lock model. It schedules every enabled sensor at its own interval, can inject point/contextual/collective anomalies, and exports timestamped telemetry to Prometheus, Kafka, or a historical Parquet dataset in S3-compatible storage.
 
 Read [architecture.md](architecture.md) for the component design and data flow,
 [simulators.md](simulators.md) for the original simulator inventory, and
@@ -72,7 +72,7 @@ anomalies:
 
 Every enabled profile evaluates its trigger only when its exact target metric is emitted. Thus `threshold: 0.999` gives approximately a 0.1% activation chance per target sample, `0` always activates when eligible, and `1` never activates. `cooldown_samples` counts later target emissions after an event. A fixed `seed` makes trigger decisions and Gaussian noise repeatable.
 
-The available profile types are `spike`, `stuck_at`, `drift`, `noise`, and `contextual`. Multi-sample durations are measured in emissions of the target sensor, not wall-clock seconds. A `stuck_at` profile with no `value` captures the last valid baseline reading; a contextual profile evaluates another sensor/metric from the current scheduler batch or its latest cached baseline. See the fully annotated profiles in [config/simulation.yaml](config/simulation.yaml) and detailed semantics in [simulators.md](simulators.md).
+The available metric-level profile types are `spike`, `stuck_at`, `drift`, `noise`, and `contextual`. Model-level profiles include `robotic_air_lock_seal_failure` and `robotic_air_lock_wet_payload`; they are resolved before the correlated air-lock model generates a frame, so they can safely affect multiple channels. Multi-sample durations are measured in emissions of the target sensor, while model-level air-lock durations are measured in production cycles. See the fully annotated profiles in [config/simulation.yaml](config/simulation.yaml) and detailed semantics in [simulators.md](simulators.md).
 
 Injection occurs after normal sensor-bound clamping, intentionally allowing an anomaly to exceed `min_value` or `max_value`. The telemetry schema is unchanged and readings are not labeled as anomalous, so downstream detection systems receive the same contract in baseline and anomaly scenarios. Each activation is recorded in the simulator log with its profile, sensor, metric, and duration.
 

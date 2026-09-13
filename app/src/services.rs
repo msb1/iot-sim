@@ -6,6 +6,7 @@ mod environment;
 mod gas;
 mod hydraulics;
 mod process;
+mod robotic_air_lock;
 mod runtime;
 mod scenario;
 
@@ -13,6 +14,9 @@ pub use base::SimulatorService;
 pub use runtime::{RunningSimulation, SimulationError, SimulationRuntime};
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::anomalies::ModelAnomalyController;
 use std::time::Instant;
 
 use crate::config::{AppConfig, SensorType};
@@ -25,11 +29,13 @@ use environment::{SoundService, WeatherService};
 use gas::GasSafetyService;
 use hydraulics::HydraulicsService;
 use process::ProcessService;
+use robotic_air_lock::RoboticAirLockService;
 use scenario::ScenarioService;
 
 pub fn build_services(
     config: &AppConfig,
     system: &SimulationSystem,
+    model_anomalies: Arc<ModelAnomalyController>,
 ) -> Vec<Box<dyn SimulatorService>> {
     let start = Instant::now();
     let mut by_type = system.sensors_by_type();
@@ -51,6 +57,7 @@ pub fn build_services(
     let load = take(SensorType::LoadCell);
     let scenario = take(SensorType::ScenarioSignal);
     let data_center_rack = take(SensorType::DataCenterRack);
+    let robotic_air_lock = take(SensorType::RoboticAirLock);
 
     let mut services: Vec<Box<dyn SimulatorService>> = Vec::new();
     if !weather.is_empty() {
@@ -116,6 +123,13 @@ pub fn build_services(
             data_center_rack,
             start,
             config.exporters.dataset.enabled,
+        )));
+    }
+    if !robotic_air_lock.is_empty() {
+        services.push(Box::new(RoboticAirLockService::new(
+            robotic_air_lock,
+            start,
+            model_anomalies,
         )));
     }
     for service in &services {

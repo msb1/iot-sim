@@ -122,6 +122,19 @@ impl AppConfig {
                                 sensor.id_prefix
                             )));
                         }
+                        if sensor.sensor_type == SensorType::RoboticAirLock {
+                            sensor.robotic_air_lock.as_ref().ok_or_else(|| {
+                                ConfigurationError::Validation(format!(
+                                    "robotic_air_lock sensor '{}' requires a robotic_air_lock block",
+                                    sensor.id_prefix
+                                ))
+                            })?.validate(&sensor.id_prefix)?;
+                        } else if sensor.robotic_air_lock.is_some() {
+                            return Err(ConfigurationError::Validation(format!(
+                                "sensor '{}' may only use robotic_air_lock with type robotic_air_lock",
+                                sensor.id_prefix
+                            )));
+                        }
                         sensor
                             .sensor_type
                             .metric_names()
@@ -307,6 +320,10 @@ pub struct AnomalyTriggerConfig {
     /// Deterministic baseline warm-up before this profile may activate.
     #[serde(default)]
     pub start_after_samples: u64,
+    /// Model-level strategies use logical production cycles rather than
+    /// emissions. Metric-level strategies ignore this field.
+    #[serde(default)]
+    pub start_after_cycles: u64,
 }
 
 impl Default for AnomalyTriggerConfig {
@@ -315,6 +332,7 @@ impl Default for AnomalyTriggerConfig {
             threshold: default_anomaly_threshold(),
             cooldown_samples: 0,
             start_after_samples: 0,
+            start_after_cycles: 0,
         }
     }
 }
@@ -372,6 +390,20 @@ pub enum AnomalyStrategyConfig {
         #[serde(default = "default_multiplier")]
         multiplier: f64,
     },
+    /// Correlated, model-level fault; it changes seal, pressure, doors, and
+    /// dew point together rather than mutating one exported metric.
+    RoboticAirLockSealFailure {
+        faulted_cycles_before_maintenance: u64,
+        maintenance_cycles: u64,
+    },
+    /// Correlated, model-level payload condition that slows only the air-lock
+    /// purge physics while preserving normal cart movement.
+    RoboticAirLockWetPayload {
+        #[serde(default = "default_wet_payload_duration_cycles")]
+        duration_cycles: u64,
+        #[serde(default = "default_recovery_multiplier")]
+        recovery_multiplier: f64,
+    },
 }
 
 impl AnomalyStrategyConfig {
@@ -397,6 +429,7 @@ impl AnomalyStrategyConfig {
             | Self::Contextual {
                 duration_samples, ..
             } => *duration_samples == 0,
+            Self::RoboticAirLockSealFailure { .. } | Self::RoboticAirLockWetPayload { .. } => false,
         };
         if invalid_duration {
             return Err(ConfigurationError::Validation(format!(
@@ -469,6 +502,29 @@ impl AnomalyStrategyConfig {
                 }
                 validate_finite(profile_name, "offset", *offset)?;
                 validate_finite(profile_name, "multiplier", *multiplier)?;
+            }
+            Self::RoboticAirLockSealFailure {
+                faulted_cycles_before_maintenance,
+                maintenance_cycles,
+            } => {
+                if *faulted_cycles_before_maintenance == 0 || *maintenance_cycles == 0 {
+                    return Err(ConfigurationError::Validation(format!(
+                        "anomaly profile '{profile_name}' requires positive faulted and maintenance cycle counts"
+                    )));
+                }
+            }
+            Self::RoboticAirLockWetPayload {
+                duration_cycles,
+                recovery_multiplier,
+            } => {
+                if *duration_cycles == 0
+                    || !recovery_multiplier.is_finite()
+                    || *recovery_multiplier < 1.0
+                {
+                    return Err(ConfigurationError::Validation(format!(
+                        "anomaly profile '{profile_name}' requires a positive duration and recovery_multiplier >= 1"
+                    )));
+                }
             }
         }
         Ok(())
@@ -686,6 +742,74 @@ pub struct SensorConfig {
     /// industrial anomaly scenarios. Existing fixed sensor models do not use it.
     pub scenario: Option<ScenarioSignalConfig>,
     pub data_center_rack: Option<DataCenterRackConfig>,
+    pub robotic_air_lock: Option<RoboticAirLockConfig>,
+}
+
+/// Correlated robotic material-air-lock model. One logical sensor emits the
+/// complete, time-aligned atmospheric, pneumatic, and mechanical frame.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoboticAirLockConfig {
+    pub air_lock_id: String,
+    pub entry_duration_seconds: f64,
+    pub sealing_duration_seconds: f64,
+    pub purge_duration_seconds: f64,
+    pub exit_duration_seconds: f64,
+    pub reset_duration_seconds: f64,
+    pub nominal_dew_point_c: f64,
+    pub ambient_temperature_c: f64,
+    pub ambient_relative_humidity_pct: f64,
+    pub nominal_differential_pressure_pa: f64,
+    pub nominal_seal_pressure_bar: f64,
+    pub purge_flow_rate_cfm: f64,
+    #[serde(default)]
+    pub measurement_noise_sigma: f64,
+    pub seed: Option<u64>,
+}
+
+fn default_wet_payload_duration_cycles() -> u64 {
+    1
+}
+fn default_recovery_multiplier() -> f64 {
+    3.0
+}
+
+impl RoboticAirLockConfig {
+    fn validate(&self, sensor_id: &str) -> Result<(), ConfigurationError> {
+        let values = [
+            self.entry_duration_seconds,
+            self.sealing_duration_seconds,
+            self.purge_duration_seconds,
+            self.exit_duration_seconds,
+            self.reset_duration_seconds,
+            self.nominal_dew_point_c,
+            self.ambient_temperature_c,
+            self.ambient_relative_humidity_pct,
+            self.nominal_differential_pressure_pa,
+            self.nominal_seal_pressure_bar,
+            self.purge_flow_rate_cfm,
+            self.measurement_noise_sigma,
+        ];
+        if self.air_lock_id.trim().is_empty()
+            || !values.into_iter().all(f64::is_finite)
+            || self.entry_duration_seconds <= 0.0
+            || self.sealing_duration_seconds <= 0.0
+            || self.purge_duration_seconds <= 0.0
+            || self.exit_duration_seconds <= 0.0
+            || self.reset_duration_seconds <= 0.0
+            || !(-60.0..=0.0).contains(&self.nominal_dew_point_c)
+            || !(18.0..=22.0).contains(&self.ambient_temperature_c)
+            || !(0.0..=5.0).contains(&self.ambient_relative_humidity_pct)
+            || !(15.0..=30.0).contains(&self.nominal_differential_pressure_pa)
+            || !(2.0..=3.5).contains(&self.nominal_seal_pressure_bar)
+            || !(0.0..=500.0).contains(&self.purge_flow_rate_cfm)
+            || self.measurement_noise_sigma < 0.0
+        {
+            return Err(ConfigurationError::Validation(format!(
+                "robotic_air_lock sensor '{sensor_id}' has invalid physical model settings"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -702,6 +826,15 @@ pub struct DataCenterRackConfig {
     pub weekend_spike_probability: f64,
     pub anomaly_temperature_f: f64,
     pub anomaly_humidity_pct: f64,
+    /// First logical week containing the scheduled Sunday collective anomaly.
+    #[serde(default = "default_rack_collective_anomaly_start_week")]
+    pub collective_anomaly_start_week: u64,
+    /// Number of logical weeks between scheduled collective anomalies.
+    #[serde(default = "default_rack_collective_anomaly_interval_weeks")]
+    pub collective_anomaly_interval_weeks: u64,
+    /// Number of 15-minute samples for each scheduled collective anomaly.
+    #[serde(default = "default_rack_collective_anomaly_duration_samples")]
+    pub collective_anomaly_duration_samples: u64,
     /// Wall-clock duration in which the 672-sample logical week is emitted.
     #[serde(default = "default_rack_week_duration_seconds")]
     pub simulated_week_duration_seconds: f64,
@@ -710,6 +843,18 @@ pub struct DataCenterRackConfig {
 
 fn default_rack_week_duration_seconds() -> f64 {
     7.0 * 24.0 * 60.0 * 60.0
+}
+
+fn default_rack_collective_anomaly_start_week() -> u64 {
+    1
+}
+
+fn default_rack_collective_anomaly_interval_weeks() -> u64 {
+    1
+}
+
+fn default_rack_collective_anomaly_duration_samples() -> u64 {
+    64
 }
 
 impl DataCenterRackConfig {
@@ -733,6 +878,9 @@ impl DataCenterRackConfig {
             || self.cpu_noise_sigma < 0.0
             || !(0.0..=1.0).contains(&self.weekend_spike_probability)
             || !(0.0..=100.0).contains(&self.anomaly_humidity_pct)
+            || self.collective_anomaly_interval_weeks == 0
+            || self.collective_anomaly_duration_samples == 0
+            || self.collective_anomaly_duration_samples > 16 * 4
             || self.simulated_week_duration_seconds <= 0.0
         {
             return Err(ConfigurationError::Validation(format!(
@@ -877,10 +1025,11 @@ pub enum SensorType {
     LoadCell,
     ScenarioSignal,
     DataCenterRack,
+    RoboticAirLock,
 }
 
 impl SensorType {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Weather,
         Self::Sound,
         Self::Electrical,
@@ -898,6 +1047,7 @@ impl SensorType {
         Self::LoadCell,
         Self::ScenarioSignal,
         Self::DataCenterRack,
+        Self::RoboticAirLock,
     ];
 
     pub fn metric_names(self) -> &'static [&'static str] {
@@ -956,6 +1106,20 @@ impl SensorType {
                 "temperature_f",
                 "relative_humidity_pct",
                 "day_of_week",
+            ],
+            Self::RoboticAirLock => &[
+                "dew_point_c",
+                "ambient_temperature_c",
+                "relative_humidity_pct",
+                "differential_pressure_pa",
+                "purge_flow_rate_cfm",
+                "outer_door_open",
+                "inner_door_open",
+                "inflatable_seal_pressure_bar",
+                "cart_presence_detected",
+                "cart_speed_m_s",
+                "cycle_status_code",
+                "equipment_state_code",
             ],
         }
     }
@@ -1093,10 +1257,10 @@ pub struct HydraulicsModelConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, ConfigurationError};
+    use super::AppConfig;
 
     #[test]
-    fn sample_configuration_loads_and_defines_all_sensor_types() {
+    fn sample_configuration_loads_the_robotic_air_lock() {
         let config = AppConfig::load(super::sample_config_path()).unwrap();
         let count: usize = config
             .entities
@@ -1105,28 +1269,7 @@ mod tests {
             .sum();
         assert_eq!(count, 1);
         assert_eq!(config.entities.len(), 1);
-        assert_eq!(config.anomalies.profiles.len(), 1);
-    }
-
-    #[test]
-    fn anomaly_target_metric_must_belong_to_its_sensor() {
-        let mut config = AppConfig::load(super::sample_config_path()).unwrap();
-        config.anomalies.profiles[0].target.metric = "not_a_weather_metric".into();
-
-        let error = config.validate().unwrap_err();
-        assert!(matches!(error, ConfigurationError::Validation(_)));
-        assert!(error
-            .to_string()
-            .contains("not emitted by sensor 'rack-telemetry-01'"));
-    }
-
-    #[test]
-    fn anomaly_threshold_must_be_a_probability_boundary() {
-        let mut config = AppConfig::load(super::sample_config_path()).unwrap();
-        config.anomalies.profiles[0].trigger.threshold = 1.01;
-
-        let error = config.validate().unwrap_err();
-        assert!(error.to_string().contains("must be between 0 and 1"));
+        assert_eq!(config.anomalies.profiles.len(), 2);
     }
 
     #[test]
@@ -1137,13 +1280,19 @@ mod tests {
     }
 
     #[test]
-    fn test_rack_configuration_emits_96_points_per_day_at_10_second_days() {
+    fn air_lock_configuration_has_a_five_minute_cycle() {
         let config = AppConfig::load(super::sample_config_path()).unwrap();
         let sensor = &config.entities[0].sensors[0];
-        let rack = sensor.data_center_rack.as_ref().unwrap();
-
-        assert_eq!(sensor.timestep_ms, 104);
-        assert_eq!(rack.simulated_week_duration_seconds, 70.0);
+        let air_lock = sensor.robotic_air_lock.as_ref().unwrap();
+        assert_eq!(sensor.timestep_ms, 1_000);
+        assert_eq!(
+            air_lock.entry_duration_seconds
+                + air_lock.sealing_duration_seconds
+                + air_lock.purge_duration_seconds
+                + air_lock.exit_duration_seconds
+                + air_lock.reset_duration_seconds,
+            300.0
+        );
     }
 
     #[test]

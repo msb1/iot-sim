@@ -10,10 +10,11 @@ pub mod telemetry;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anomalies::AnomalyInjector;
+use anomalies::{AnomalyEventCollector, AnomalyInjector, ModelAnomalyController};
 use chrono::DateTime;
 use config::AppConfig;
 use export::dataset::DatasetExporter;
+use export::metadata::MetadataExporter;
 #[cfg(feature = "kafka")]
 use export::kafka::KafkaExporter;
 use export::prometheus::PrometheusExporter;
@@ -22,7 +23,9 @@ use services::{build_services, SimulationError, SimulationRuntime};
 
 pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, SimulationError> {
     let system = domain::SimulationSystem::from_config(config);
-    let services = build_services(config, &system);
+    let anomaly_events = Arc::new(AnomalyEventCollector::default());
+    let model_anomalies = Arc::new(ModelAnomalyController::from_config_with_events(&config.anomalies, anomaly_events.clone()));
+    let services = build_services(config, &system, model_anomalies.clone());
     let anomaly_injector = AnomalyInjector::from_config(&config.anomalies);
     let mut exporters: Vec<Arc<dyn TelemetryExporter>> = Vec::new();
     let dataset_start_ms = if config.exporters.dataset.enabled {
@@ -75,13 +78,14 @@ pub async fn build_runtime(config: &AppConfig) -> Result<SimulationRuntime, Simu
                 }
             })?,
         ));
+        exporters.push(Arc::new(MetadataExporter::new(config.exporters.dataset.clone(), start_ms, anomaly_events)));
     }
     tracing::info!(
         config = %config.config_name,
         services = services.len(),
         exporters = exporters.len(),
         simulator_stream = config.logging.simulator_stream.enabled,
-        anomaly_profiles = anomaly_injector.active_profile_count(),
+        anomaly_profiles = anomaly_injector.active_profile_count() + model_anomalies.active_profile_count(),
         "simulation runtime assembled"
     );
     Ok(SimulationRuntime::new(
